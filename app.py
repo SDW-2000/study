@@ -1,18 +1,56 @@
+"""Run locally with .venv/bin/python app.py.
+
+For HTTPS deployment, set APP_ENV=production, a random SECRET_KEY (32+ bytes),
+and TRUSTED_HOSTS (comma-separated hostnames) in the server environment.
+Use a production WSGI server; configure HTTPS at the server or trusted proxy.
+"""
+
+import hashlib
 import os
+import re
 import secrets
 import sqlite3
+import time
 from datetime import timedelta
 from pathlib import Path
 
 from flask import Flask, abort, g, redirect, render_template_string, request, session, url_for
+from werkzeug.exceptions import HTTPException, TooManyRequests
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
-app = Flask(__name__)
+environment = os.environ.get("APP_ENV", "development")
+if environment not in {"development", "production"}:
+    raise RuntimeError("APP_ENV must be development or production.")
+production = environment == "production"
+secret_key = os.environ.get("SECRET_KEY")
+trusted_hosts = [host.strip() for host in os.environ.get("TRUSTED_HOSTS", "").split(",") if host.strip()]
+if secret_key is not None and len(secret_key.encode("utf-8")) < 32:
+    raise RuntimeError("SECRET_KEY must contain at least 32 random bytes.")
+if production and (not secret_key or not trusted_hosts):
+    raise RuntimeError("Production requires SECRET_KEY and TRUSTED_HOSTS.")
+
+PASSWORD_MIN_LENGTH = 15
+PASSWORD_MAX_LENGTH = 128
+TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
+AUTH_LIMITS = {"login": (10, 300), "register": (5, 3600)}
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_hex(32))
+
+app = Flask(__name__, static_folder=None)
 app.config.update(
-    SECRET_KEY=os.environ.get("SECRET_KEY") or secrets.token_hex(32),
+    SECRET_KEY=secret_key or secrets.token_hex(32),
     DATABASE=os.environ.get("DATABASE_PATH") or str(Path(__file__).with_name("users.db")),
+    PRODUCTION=production,
+    DEBUG=False,
+    TRUSTED_HOSTS=trusted_hosts or ["localhost", "127.0.0.1", "[::1]"],
+    MAX_CONTENT_LENGTH=16 * 1024,
+    MAX_FORM_MEMORY_SIZE=16 * 1024,
+    MAX_FORM_PARTS=3,
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    SESSION_REFRESH_EACH_REQUEST=False,
+    SESSION_COOKIE_NAME="__Host-memo_session" if production else "memo_session",
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_SECURE=production,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
@@ -23,7 +61,7 @@ PAGE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} · 메모</title>
-  <style>
+  <style nonce="{{ csp_nonce }}">
     :root {
       color-scheme: light;
       font: 100%/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -100,12 +138,17 @@ PAGE = """<!doctype html>
 <body>
   <div class="shell">
     <header class="site-header">
-      <a class="brand" href="{{ url_for('index') }}">메모</a>
+      <a class="brand" href="{{ '/' if page == 'error' else url_for('index') }}">메모</a>
       <span class="site-label">나의 공간</span>
     </header>
     <main>
       <section class="panel" aria-labelledby="page-title">
-        {% if page == "home" %}
+        {% if page == "error" %}
+          <p class="eyebrow">요청 안내</p>
+          <h1 id="page-title">{{ title }}</h1>
+          <p class="message error" role="alert">{{ error }}</p>
+          <div class="actions"><a class="button secondary" href="/">홈으로 돌아가기</a></div>
+        {% elif page == "home" %}
           {% if username %}
             <p class="eyebrow">로그인 상태</p>
             <h1 id="page-title">안녕하세요,<br>{{ username }}님.</h1>
@@ -137,12 +180,13 @@ PAGE = """<!doctype html>
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <div class="field">
               <label for="username">아이디</label>
-              <input id="username" name="username" autocomplete="username" required maxlength="30" {% if page == "register" %}minlength="3"{% endif %}>
+              <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="30" {% if page == "register" %}minlength="3" aria-describedby="username-hint"{% endif %}>
+              {% if page == "register" %}<small class="hint" id="username-hint">3~30자. 글자, 숫자, 밑줄(_), 점(.), 하이픈(-)을 사용할 수 있어요.</small>{% endif %}
             </div>
             <div class="field">
               <label for="password">비밀번호</label>
-              <input id="password" type="password" name="password" autocomplete="{% if page == 'register' %}new-password{% else %}current-password{% endif %}" required {% if page == "register" %}minlength="8" maxlength="128" aria-describedby="password-hint"{% endif %}>
-              {% if page == "register" %}<small class="hint" id="password-hint">8자 이상 입력해 주세요.</small>{% endif %}
+              <input id="password" type="password" name="password" autocomplete="{% if page == 'register' %}new-password{% else %}current-password{% endif %}" required maxlength="{{ password_max_length }}" {% if page == "register" %}minlength="{{ password_min_length }}" aria-describedby="password-hint"{% endif %}>
+              {% if page == "register" %}<small class="hint" id="password-hint">{{ password_min_length }}~{{ password_max_length }}자. 여러 단어를 조합해 보세요.</small>{% endif %}
             </div>
             <div class="actions"><button class="button primary" type="submit">{{ title }}</button></div>
           </form>
@@ -163,6 +207,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(app.config["DATABASE"])
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
 
@@ -174,15 +219,128 @@ def close_db(_error):
 
 
 def init_db():
+    db_path = Path(app.config["DATABASE"])
+    descriptor = os.open(db_path, os.O_CREAT | os.O_RDWR, 0o600)
+    os.close(descriptor)
+    db_path.chmod(0o600)
     with app.app_context():
         db = get_db()
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS auth_sessions_expiry ON auth_sessions(expires_at);
+            CREATE TABLE IF NOT EXISTS auth_limits (
+                key TEXT PRIMARY KEY,
+                attempts INTEGER NOT NULL,
+                resets_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS auth_limits_expiry ON auth_limits(resets_at);
+        """)
+
+
+def token_digest(token):
+    return hashlib.sha256(token.encode("ascii")).hexdigest()
+
+
+def enforce_auth_limit():
+    limit, window = AUTH_LIMITS[request.endpoint]
+    # Use the actual peer address. Forwarded headers are not trusted by default.
+    source = f"{request.endpoint}:{request.remote_addr or 'unknown'}"
+    key = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    now = int(time.time())
+    db = get_db()
+    # SQLite serializes this write transaction, including across WSGI workers.
+    with db:
+        db.execute("DELETE FROM auth_limits WHERE resets_at <= ?", (now,))
         db.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "id INTEGER PRIMARY KEY, "
-            "username TEXT NOT NULL UNIQUE, "
-            "password_hash TEXT NOT NULL)"
+            "INSERT INTO auth_limits (key, attempts, resets_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(key) DO UPDATE SET attempts = MIN(auth_limits.attempts + 1, ?)",
+            (key, now + window, limit + 1),
         )
-        db.commit()
+        entry = db.execute("SELECT attempts, resets_at FROM auth_limits WHERE key = ?", (key,)).fetchone()
+    if entry["attempts"] > limit:
+        raise TooManyRequests(retry_after=max(1, entry["resets_at"] - now))
+
+
+@app.before_request
+def prepare_request():
+    g.csp_nonce = secrets.token_urlsafe(24)
+    g.user = None
+    if request.routing_exception is not None:
+        return
+    if app.config["PRODUCTION"] and not request.is_secure:
+        abort(400)
+    if request.method == "POST":
+        if request.mimetype != "application/x-www-form-urlencoded":
+            abort(415)
+        fields = {"csrf_token"} if request.endpoint == "logout" else {"csrf_token", "username", "password"}
+        if set(request.form) != fields or any(len(request.form.getlist(field)) != 1 for field in fields):
+            abort(400)
+        check_csrf()
+        if request.endpoint in AUTH_LIMITS:
+            enforce_auth_limit()
+
+    token = session.get("auth_token")
+    if token is None:
+        return
+    if not isinstance(token, str) or TOKEN_PATTERN.fullmatch(token) is None:
+        session.clear()
+        return
+    db = get_db()
+    digest = token_digest(token)
+    g.user = db.execute(
+        "SELECT users.id, users.username FROM auth_sessions "
+        "JOIN users ON users.id = auth_sessions.user_id "
+        "WHERE auth_sessions.token_hash = ? AND auth_sessions.expires_at > ?",
+        (digest, int(time.time())),
+    ).fetchone()
+    if g.user is None:
+        with db:
+            db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (digest,))
+        session.clear()
+
+
+@app.after_request
+def secure_response(response):
+    nonce = getattr(g, "csp_nonce", "")
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; style-src 'nonce-{nonce}'; "
+        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    if app.config["PRODUCTION"]:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
+
+
+@app.errorhandler(HTTPException)
+@app.errorhandler(500)
+def safe_error_response(error):
+    messages = {
+        400: "요청을 확인할 수 없습니다. 페이지를 새로 열고 다시 시도해 주세요.",
+        404: "요청한 페이지를 찾을 수 없습니다.",
+        405: "지원하지 않는 요청 방식입니다.",
+        413: "입력한 데이터가 너무 큽니다.",
+        415: "화면의 입력 양식을 사용해 주세요.",
+        429: "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
+        500: "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+    }
+    response = error.get_response()
+    html, _ = page("error", "요청을 처리할 수 없어요", error=messages.get(error.code, messages[400]), status=error.code)
+    response.set_data(html)
+    response.content_type = "text/html; charset=utf-8"
+    return response
 
 
 def csrf_token():
@@ -194,7 +352,12 @@ def csrf_token():
 def check_csrf():
     supplied = request.form.get("csrf_token", "")
     expected = session.get("csrf_token", "")
-    if not expected or not secrets.compare_digest(supplied, expected):
+    if (
+        TOKEN_PATTERN.fullmatch(supplied) is None
+        or not isinstance(expected, str)
+        or TOKEN_PATTERN.fullmatch(expected) is None
+        or not secrets.compare_digest(supplied, expected)
+    ):
         abort(400)
 
 
@@ -207,7 +370,10 @@ def page(name, title, *, username=None, error=None, notice=None, status=200):
             username=username,
             error=error,
             notice=notice,
-            csrf_token=csrf_token(),
+            csrf_token=csrf_token() if name != "error" else "",
+            csp_nonce=g.csp_nonce,
+            password_min_length=PASSWORD_MIN_LENGTH,
+            password_max_length=PASSWORD_MAX_LENGTH,
         ),
         status,
     )
@@ -215,29 +381,20 @@ def page(name, title, *, username=None, error=None, notice=None, status=200):
 
 @app.route("/")
 def index():
-    user_id = session.get("user_id")
-    username = None
-    if user_id is not None:
-        user = get_db().execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
-        if user is None:
-            session.clear()
-        else:
-            username = user["username"]
-    return page("home", "홈", username=username)
+    return page("home", "홈", username=g.user["username"] if g.user else None)
 
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
-    if session.get("user_id") is not None:
+    if g.user is not None:
         return redirect(url_for("index"))
     if request.method == "POST":
-        check_csrf()
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        if not 3 <= len(username) <= 30 or any(char.isspace() for char in username):
-            return page("register", "회원가입", error="아이디는 공백 없이 3~30자로 입력하세요.", status=400)
-        if not 8 <= len(password) <= 128:
-            return page("register", "회원가입", error="비밀번호는 8~128자로 입력하세요.", status=400)
+        if not 3 <= len(username) <= 30 or not all(char.isalnum() or char in "_.-" for char in username):
+            return page("register", "회원가입", error="아이디는 3~30자의 글자, 숫자, 밑줄, 점, 하이픈으로 입력하세요.", status=400)
+        if not PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH:
+            return page("register", "회원가입", error=f"비밀번호는 {PASSWORD_MIN_LENGTH}~{PASSWORD_MAX_LENGTH}자로 입력하세요.", status=400)
         db = get_db()
         try:
             db.execute(
@@ -254,19 +411,32 @@ def register():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    if session.get("user_id") is not None:
+    if g.user is not None:
         return redirect(url_for("index"))
     if request.method == "POST":
-        check_csrf()
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        invalid_login = "아이디 또는 비밀번호가 올바르지 않습니다."
+        if not 3 <= len(username) <= 30 or not 1 <= len(password) <= PASSWORD_MAX_LENGTH:
+            return page("login", "로그인", error=invalid_login, status=401)
         user = get_db().execute(
             "SELECT id, password_hash FROM users WHERE username = ?", (username,)
         ).fetchone()
-        if user is None or not check_password_hash(user["password_hash"], password):
-            return page("login", "로그인", error="아이디 또는 비밀번호가 올바르지 않습니다.", status=401)
+        password_matches = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH, password)
+        if user is None or not password_matches:
+            return page("login", "로그인", error=invalid_login, status=401)
+        token = secrets.token_hex(32)
+        now = int(time.time())
+        expires_at = now + int(app.permanent_session_lifetime.total_seconds())
+        db = get_db()
+        with db:
+            db.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
+            db.execute(
+                "INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                (token_digest(token), user["id"], expires_at),
+            )
         session.clear()
-        session["user_id"] = user["id"]
+        session["auth_token"] = token
         session.permanent = True
         return redirect(url_for("index"))
     notice = None
@@ -279,7 +449,11 @@ def login():
 
 @app.post("/logout")
 def logout():
-    check_csrf()
+    token = session.get("auth_token")
+    if token is not None:
+        db = get_db()
+        with db:
+            db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_digest(token),))
     session.clear()
     return redirect(url_for("login", logged_out=1))
 
@@ -287,4 +461,6 @@ def logout():
 init_db()
 
 if __name__ == "__main__":
-    app.run()
+    if production:
+        raise RuntimeError("Use a production WSGI server with HTTPS instead of app.run().")
+    app.run(host="127.0.0.1", debug=False)

@@ -1,0 +1,5 @@
+# Only these files may enter the image build context.
+**
+!Dockerfile
+!requirements.txt
+!app.py

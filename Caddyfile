@@ -1,0 +1,15 @@
+{
+	admin off
+	skip_install_trust
+}
+
+{$SITE_ADDRESS} {
+	reverse_proxy app:8000 {
+		# The app trusts exactly this proxy. Replace supplied client identity.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Protocol
+		header_up -X-Forwarded-Ssl
+	}
+}

@@ -1,0 +1,70 @@
+services:
+  app:
+    build: .
+    environment:
+      APP_ENV: production
+      TRUST_PROXY: "1"
+      TRUSTED_HOSTS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env to your server IP or domain}
+      SECRET_KEY: ${SECRET_KEY:?Set a strong persistent SECRET_KEY in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set an initial ADMIN_PASSWORD in .env}
+      ADMIN_NOTE: ${ADMIN_NOTE:-}
+      DATABASE_PATH: /data/users.db
+    volumes:
+      - memo_data:/data
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, urllib.request; r = urllib.request.Request('http://127.0.0.1:8000/login', headers={'Host': os.environ['TRUSTED_HOSTS'], 'X-Forwarded-Proto': 'https'}); urllib.request.urlopen(r, timeout=5).close()"
+      interval: 30s
+      timeout: 6s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in .env to your server IP or domain}
+    ports:
+      - "${BIND_IP:-0.0.0.0}:${HTTP_PORT:-80}:80"
+      - "${BIND_IP:-0.0.0.0}:${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - backend
+      - edge
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  backend:
+    internal: true
+  edge:
+
+volumes:
+  memo_data:
+  caddy_data:
+  caddy_config:

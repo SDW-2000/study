@@ -19,6 +19,7 @@ from pathlib import Path
 
 from flask import Flask, abort, g, redirect, render_template_string, request, session, url_for
 from werkzeug.exceptions import HTTPException, TooManyRequests
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
@@ -32,6 +33,9 @@ if secret_key is not None and len(secret_key.encode("utf-8")) < 32:
     raise RuntimeError("SECRET_KEY must contain at least 32 random bytes.")
 if production and (not secret_key or not trusted_hosts):
     raise RuntimeError("Production requires SECRET_KEY and TRUSTED_HOSTS.")
+trust_proxy = os.environ.get("TRUST_PROXY", "0")
+if trust_proxy not in {"0", "1"}:
+    raise RuntimeError("TRUST_PROXY must be 0 or 1.")
 
 PASSWORD_MIN_LENGTH = 15
 PASSWORD_MAX_LENGTH = 128
@@ -39,7 +43,10 @@ NOTE_TITLE_MAX_LENGTH = 120
 NOTE_CONTENT_MAX_LENGTH = 10000
 PAGE_SIZE = 20
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
-AUTH_LIMITS = {"login": (10, 300), "register": (5, 3600)}
+AUTH_LIMITS = {
+    "login": (10, 300), "register": (5, 3600),
+    "change_password": (5, 300), "admin_change_password": (5, 300),
+}
 POST_FIELDS = {
     "register": {"csrf_token", "username", "password"},
     "login": {"csrf_token", "username", "password"},
@@ -47,6 +54,8 @@ POST_FIELDS = {
     "create_note": {"csrf_token", "title", "content"},
     "edit_note": {"csrf_token", "title", "content"},
     "delete_note": {"csrf_token"},
+    "change_password": {"csrf_token", "current_password", "new_password", "confirm_password"},
+    "admin_change_password": {"csrf_token", "current_password", "new_password", "confirm_password"},
 }
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_hex(32))
 
@@ -68,6 +77,10 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
+if trust_proxy == "1":
+    # Only enable behind the single Caddy proxy on the private Docker network.
+    # Caddy replaces client-supplied forwarding headers; port 8000 is not published.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_prefix=0)
 
 PAGE = """<!doctype html>
 <html lang="ko">
@@ -185,6 +198,7 @@ PAGE = """<!doctype html>
       {% if current_user and page != "error" %}
         <nav class="account-nav" aria-label="계정 메뉴">
           <a href="{{ url_for('list_notes') }}">내 메모</a>
+          <a href="{{ url_for('change_password') }}">비밀번호 변경</a>
           {% if current_user.is_admin %}<a href="{{ url_for('admin_users') }}">회원 관리</a>{% endif %}
           <form method="post" action="{{ url_for('logout') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -270,14 +284,41 @@ PAGE = """<!doctype html>
           <p class="eyebrow">관리자</p>
           <h1 id="page-title">회원 관리</h1>
           <p class="lead">전체 회원 {{ total }}명</p>
+          {% if notice %}<p class="message notice" role="status">{{ notice }}</p>{% endif %}
           <div class="table-wrap">
             <table aria-label="전체 회원 목록">
-              <thead><tr><th scope="col">번호</th><th scope="col">아이디</th><th scope="col">역할</th></tr></thead>
+              <thead><tr><th scope="col">번호</th><th scope="col">아이디</th><th scope="col">역할</th><th scope="col">관리</th></tr></thead>
               <tbody>{% for member in members %}
-                <tr><td>{{ member.id }}</td><td class="member-name">{{ member.username }}</td><td class="role-label">{{ '관리자' if member.is_admin else '회원' }}</td></tr>
+                <tr><td>{{ member.id }}</td><td class="member-name">{{ member.username }}</td><td class="role-label">{{ '관리자' if member.is_admin else '회원' }}</td><td><a class="button secondary compact" href="{{ url_for('admin_change_password', user_id=member.id) }}" aria-label="{{ member.username }} 비밀번호 변경">비밀번호 변경</a></td></tr>
               {% endfor %}</tbody>
             </table>
           </div>
+        {% elif page == "password_change" %}
+          <p class="eyebrow">{{ '회원 관리' if admin_action else '내 계정' }}</p>
+          <h1 id="page-title">{{ title }}</h1>
+          <p class="lead">{{ member.username }} 계정의 비밀번호를 변경합니다.</p>
+          <p class="hint" id="session-hint">변경하면 해당 계정의 모든 기기에서 로그아웃됩니다. 새 비밀번호로 다시 로그인해 주세요.</p>
+          {% if error %}<p class="message error" role="alert">{{ error }}</p>{% endif %}
+          <form class="auth-form" method="post" aria-describedby="session-hint">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field">
+              <label for="current-password">{{ '관리자 본인의 현재 비밀번호' if admin_action else '현재 비밀번호' }}</label>
+              <input id="current-password" type="password" name="current_password" autocomplete="current-password" required maxlength="{{ password_max_length }}">
+            </div>
+            <div class="field">
+              <label for="new-password">새 비밀번호</label>
+              <input id="new-password" type="password" name="new_password" autocomplete="new-password" required minlength="{{ password_min_length }}" maxlength="{{ password_max_length }}" aria-describedby="password-hint">
+              <small class="hint" id="password-hint">{{ password_min_length }}~{{ password_max_length }}자. 여러 단어를 조합해 보세요.</small>
+            </div>
+            <div class="field">
+              <label for="confirm-password">새 비밀번호 확인</label>
+              <input id="confirm-password" type="password" name="confirm_password" autocomplete="new-password" required minlength="{{ password_min_length }}" maxlength="{{ password_max_length }}">
+            </div>
+            <div class="inline-actions">
+              <a class="button secondary" href="{{ url_for('admin_users' if admin_action else 'list_notes') }}">취소</a>
+              <button class="button primary" type="submit">비밀번호 변경</button>
+            </div>
+          </form>
         {% elif page == "home" %}
           {% if username %}
             <p class="eyebrow">로그인 상태</p>
@@ -423,10 +464,13 @@ def token_digest(token):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def enforce_auth_limit():
+def enforce_auth_limit(*, account_id=None):
     limit, window = AUTH_LIMITS[request.endpoint]
     # Use the actual peer address. Forwarded headers are not trusted by default.
     source = f"{request.endpoint}:{request.remote_addr or 'unknown'}"
+    if account_id is not None:
+        # Both password-change screens share a limit for the acting account.
+        source = f"password-change:account:{account_id}"
     key = hashlib.sha256(source.encode("utf-8")).hexdigest()
     now = int(time.time())
     db = get_db()
@@ -462,7 +506,7 @@ def prepare_request():
         if set(request.form) != fields or any(len(request.form.getlist(field)) != 1 for field in fields):
             abort(400)
         check_csrf()
-        if request.endpoint in AUTH_LIMITS:
+        if request.endpoint in {"login", "register"}:
             enforce_auth_limit()
 
     token = session.get("auth_token")
@@ -509,6 +553,7 @@ def safe_error_response(error):
         403: "이 페이지에 접근할 권한이 없습니다.",
         404: "요청한 페이지를 찾을 수 없습니다.",
         405: "지원하지 않는 요청 방식입니다.",
+        409: "계정 정보가 변경되었습니다. 페이지를 새로 열고 다시 시도해 주세요.",
         413: "입력한 데이터가 너무 큽니다.",
         415: "화면의 입력 양식을 사용해 주세요.",
         429: "요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.",
@@ -667,16 +712,22 @@ def login():
         db = get_db()
         with db:
             db.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (now,))
-            db.execute(
-                "INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
-                (token_digest(token), user["id"], expires_at),
+            # A concurrent password change must not issue a session for the old hash.
+            result = db.execute(
+                "INSERT INTO auth_sessions (token_hash, user_id, expires_at) "
+                "SELECT ?, id, ? FROM users WHERE id = ? AND password_hash = ?",
+                (token_digest(token), expires_at, user["id"], user["password_hash"]),
             )
+            if result.rowcount != 1:
+                return page("login", "로그인", error=invalid_login, status=401)
         session.clear()
         session["auth_token"] = token
         session.permanent = True
         return redirect(url_for("index"))
     notice = None
-    if request.args.get("registered") == "1":
+    if request.args.get("password_changed") == "1":
+        notice = "비밀번호가 변경되어 모든 기기에서 로그아웃되었습니다. 새 비밀번호로 로그인하세요."
+    elif request.args.get("registered") == "1":
         notice = "회원가입이 완료되었습니다. 로그인하세요."
     elif request.args.get("logged_out") == "1":
         notice = "로그아웃되었습니다."
@@ -692,6 +743,83 @@ def logout():
             db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_digest(token),))
     session.clear()
     return redirect(url_for("login", logged_out=1))
+
+
+def password_change_form(member, *, admin_action=False):
+    error, status = None, 200
+    if request.method == "POST":
+        enforce_auth_limit(account_id=g.user["id"])
+        current = request.form["current_password"]
+        new = request.form["new_password"]
+        confirmation = request.form["confirm_password"]
+        db = get_db()
+        actor = db.execute("SELECT password_hash FROM users WHERE id = ?", (g.user["id"],)).fetchone()
+        if not PASSWORD_MIN_LENGTH <= len(new) <= PASSWORD_MAX_LENGTH:
+            error, status = f"새 비밀번호는 {PASSWORD_MIN_LENGTH}~{PASSWORD_MAX_LENGTH}자로 입력하세요.", 400
+        elif new != confirmation:
+            error, status = "새 비밀번호와 확인 입력이 일치하지 않습니다.", 400
+        elif not 1 <= len(current) <= PASSWORD_MAX_LENGTH or actor is None or not check_password_hash(actor["password_hash"], current):
+            error, status = "현재 비밀번호가 올바르지 않습니다.", 401
+        elif check_password_hash(member["password_hash"], new):
+            error, status = "기존 비밀번호와 다른 새 비밀번호를 입력하세요.", 400
+        else:
+            new_hash = generate_password_hash(new)
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                # Recheck authority inside the write transaction, including revocation
+                # or password/role changes while password hashing was in progress.
+                authorized = db.execute(
+                    "SELECT 1 FROM users JOIN auth_sessions ON auth_sessions.user_id = users.id "
+                    "WHERE users.id = ? AND users.password_hash = ? "
+                    "AND auth_sessions.token_hash = ? AND auth_sessions.expires_at > ? "
+                    "AND (? = 0 OR users.is_admin = 1)",
+                    (g.user["id"], actor["password_hash"], token_digest(session["auth_token"]),
+                     int(time.time()), int(admin_action)),
+                ).fetchone()
+                if authorized is None:
+                    abort(403)
+                result = db.execute(
+                    "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+                    (new_hash, member["id"], member["password_hash"]),
+                )
+                if result.rowcount != 1:
+                    abort(409)
+                db.execute("DELETE FROM auth_sessions WHERE user_id = ?", (member["id"],))
+            if member["id"] == g.user["id"]:
+                session.clear()
+                return redirect(url_for("login", password_changed=1))
+            session["csrf_token"] = secrets.token_hex(32)
+            return redirect(url_for("admin_users", password_changed=1))
+    return page(
+        "password_change", "회원 비밀번호 변경" if admin_action else "비밀번호 변경",
+        member=member, admin_action=admin_action, error=error, status=status,
+    )
+
+
+@app.route("/account/password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    member = get_db().execute(
+        "SELECT id, username, password_hash FROM users WHERE id = ?", (g.user["id"],)
+    ).fetchone()
+    if member is None:
+        abort(404)
+    return password_change_form(member)
+
+
+@app.route("/admin/users/<int:user_id>/password", methods=["GET", "POST"])
+@login_required
+def admin_change_password(user_id):
+    if not g.user["is_admin"]:
+        abort(403)
+    if not 1 <= user_id <= 2**63 - 1:
+        abort(404)
+    member = get_db().execute(
+        "SELECT id, username, password_hash FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    if member is None:
+        abort(404)
+    return password_change_form(member, admin_action=True)
 
 
 @app.get("/notes")
@@ -790,7 +918,10 @@ def admin_users():
         "SELECT id, username, is_admin FROM users ORDER BY id LIMIT ? OFFSET ?",
         (PAGE_SIZE, (number - 1) * PAGE_SIZE),
     ).fetchall()
-    return page("admin", "회원 관리", members=members, total=total, number=number, pages=pages)
+    return page(
+        "admin", "회원 관리", members=members, total=total, number=number, pages=pages,
+        notice="회원 비밀번호를 변경하고 해당 회원의 모든 로그인을 종료했습니다." if request.args.get("password_changed") == "1" else None,
+    )
 
 
 init_db()
@@ -798,7 +929,7 @@ init_db()
 if __name__ == "__main__":
     if production:
         raise RuntimeError("Use a production WSGI server with HTTPS instead of app.run().")
-    port = os.environ.get("PORT", "5001")
+    port = os.environ.get("PORT", "8000")
     if re.fullmatch(r"[0-9]{1,5}", port) is None or not 1 <= int(port) <= 65535:
         raise RuntimeError("PORT must be an integer between 1 and 65535.")
-    app.run(host="127.0.0.1", port=int(port), debug=False)
+    app.run(host="0.0.0.0", port=int(port), debug=False)

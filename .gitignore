@@ -5,3 +5,4 @@ users.db
 users.db-*
 .env
 .env.*
+.admin-initial-password

@@ -1,5 +1,7 @@
 """Run locally with .venv/bin/python app.py.
 
+On the first launch, set ADMIN_PASSWORD (15-128 characters) to seed the admin
+account. ADMIN_NOTE may provide an initial SBOB{...} note; both are used once.
 For HTTPS deployment, set APP_ENV=production, a random SECRET_KEY (32+ bytes),
 and TRUSTED_HOSTS (comma-separated hostnames) in the server environment.
 Use a production WSGI server; configure HTTPS at the server or trusted proxy.
@@ -11,7 +13,8 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 
 from flask import Flask, abort, g, redirect, render_template_string, request, session, url_for
@@ -32,8 +35,19 @@ if production and (not secret_key or not trusted_hosts):
 
 PASSWORD_MIN_LENGTH = 15
 PASSWORD_MAX_LENGTH = 128
+NOTE_TITLE_MAX_LENGTH = 120
+NOTE_CONTENT_MAX_LENGTH = 10000
+PAGE_SIZE = 20
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
 AUTH_LIMITS = {"login": (10, 300), "register": (5, 3600)}
+POST_FIELDS = {
+    "register": {"csrf_token", "username", "password"},
+    "login": {"csrf_token", "username", "password"},
+    "logout": {"csrf_token"},
+    "create_note": {"csrf_token", "title", "content"},
+    "edit_note": {"csrf_token", "title", "content"},
+    "delete_note": {"csrf_token"},
+}
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_hex(32))
 
 app = Flask(__name__, static_folder=None)
@@ -43,8 +57,8 @@ app.config.update(
     PRODUCTION=production,
     DEBUG=False,
     TRUSTED_HOSTS=trusted_hosts or ["localhost", "127.0.0.1", "[::1]"],
-    MAX_CONTENT_LENGTH=16 * 1024,
-    MAX_FORM_MEMORY_SIZE=16 * 1024,
+    MAX_CONTENT_LENGTH=128 * 1024,
+    MAX_FORM_MEMORY_SIZE=128 * 1024,
     MAX_FORM_PARTS=3,
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
     SESSION_REFRESH_EACH_REQUEST=False,
@@ -82,7 +96,7 @@ PAGE = """<!doctype html>
     body { min-height: 100svh; margin: 0; background: var(--background); color: var(--text); }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    a:focus-visible, button:focus-visible, input:focus-visible {
+    a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible {
       outline: 3px solid var(--focus);
       outline-offset: 3px;
     }
@@ -115,6 +129,35 @@ PAGE = """<!doctype html>
     .button.secondary { border-color: var(--border); background: var(--surface); color: var(--text); }
     .button.secondary:hover { background: var(--background); }
     .switch { margin: 1.5rem 0 0; color: var(--muted); font-size: .91rem; text-align: center; }
+    .account-nav { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: .4rem 1rem; font-size: .9rem; }
+    .account-nav > a { display: inline-flex; min-height: 2.75rem; align-items: center; }
+    .account-nav form { margin: 0; }
+    .button.compact { min-height: 2.75rem; padding: .5rem .9rem; font-size: .9rem; }
+    main.workspace { place-items: start center; }
+    .panel-wide { width: min(100%, 52rem); min-width: 0; }
+    .section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1.5rem; }
+    .section-heading > div { min-width: 0; }
+    .note-list { list-style: none; padding: 0; margin: 2rem 0 0; }
+    .note-list li + li { border-top: 1px solid var(--border); }
+    .note-link { display: block; padding: 1.2rem .2rem; color: var(--text); border-radius: .4rem; }
+    .note-link:hover { text-decoration: none; background: var(--background); }
+    .note-link h2 { margin: 0; font-size: 1.15rem; letter-spacing: -.02em; overflow-wrap: anywhere; }
+    .preview { margin: .55rem 0; color: var(--muted); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .note-meta { color: var(--muted); font-size: .8rem; }
+    .note-content { margin: 2rem 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
+    textarea { display: block; width: 100%; min-height: 18rem; resize: vertical; padding: .85rem 1rem; border: 1px solid var(--border); border-radius: .85rem; background: var(--surface); color: var(--text); font: inherit; line-height: 1.7; }
+    .inline-actions { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.5rem; }
+    .inline-actions .button { flex: 1 1 7rem; }
+    .button.danger { color: #fff; background: #b42318; }
+    .button.danger:hover { background: #912018; }
+    .empty-state { padding: 2rem 0; }
+    .pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; border-top: 1px solid var(--border); margin-top: 1.5rem; padding-top: 1.5rem; }
+    .table-wrap { overflow-x: auto; margin-top: 2rem; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    th { color: var(--muted); font-size: .85rem; font-weight: 650; }
+    th, td { padding: 1rem .5rem; border-bottom: 1px solid var(--border); }
+    td.member-name { overflow-wrap: anywhere; }
+    .role-label { white-space: nowrap; font-size: .9rem; }
     @media (max-width: 30rem) {
       .shell { padding: 1.1rem 1rem; }
       main { padding: 2rem 0; }
@@ -126,7 +169,7 @@ PAGE = """<!doctype html>
       .button.primary { color: #fff; }
     }
     @media (prefers-contrast: more) {
-      .panel, input:not([type="hidden"]), .button.secondary { border: 2px solid var(--text); }
+      .panel, input:not([type="hidden"]), textarea, .button.secondary { border: 2px solid var(--text); }
       .lead, .hint, .switch, .site-label { color: var(--text); }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -139,15 +182,102 @@ PAGE = """<!doctype html>
   <div class="shell">
     <header class="site-header">
       <a class="brand" href="{{ '/' if page == 'error' else url_for('index') }}">메모</a>
-      <span class="site-label">나의 공간</span>
+      {% if current_user and page != "error" %}
+        <nav class="account-nav" aria-label="계정 메뉴">
+          <a href="{{ url_for('list_notes') }}">내 메모</a>
+          {% if current_user.is_admin %}<a href="{{ url_for('admin_users') }}">회원 관리</a>{% endif %}
+          <form method="post" action="{{ url_for('logout') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button secondary compact" type="submit">로그아웃</button>
+          </form>
+        </nav>
+      {% else %}
+        <span class="site-label">나의 공간</span>
+      {% endif %}
     </header>
-    <main>
-      <section class="panel" aria-labelledby="page-title">
+    <main{% if page in ['notes', 'note_form', 'note_detail', 'admin'] %} class="workspace"{% endif %}>
+      <section class="panel{% if page in ['notes', 'note_form', 'note_detail', 'admin'] %} panel-wide{% endif %}" aria-labelledby="page-title">
         {% if page == "error" %}
           <p class="eyebrow">요청 안내</p>
           <h1 id="page-title">{{ title }}</h1>
           <p class="message error" role="alert">{{ error }}</p>
           <div class="actions"><a class="button secondary" href="/">홈으로 돌아가기</a></div>
+        {% elif page == "notes" %}
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">{{ current_user.username }}님의 공간</p>
+              <h1 id="page-title">내 메모</h1>
+              <p class="lead">나만 볼 수 있는 기록, {{ total }}개</p>
+            </div>
+            <a class="button primary" href="{{ url_for('create_note') }}">새 메모</a>
+          </div>
+          {% if notice %}<p class="message notice" role="status">{{ notice }}</p>{% endif %}
+          {% if notes %}
+            <ol class="note-list">
+              {% for note in notes %}
+                <li><a class="note-link" href="{{ url_for('view_note', note_id=note.id) }}">
+                  <h2>{{ note.title }}</h2>
+                  <p class="preview">{{ note.preview }}</p>
+                  <span class="note-meta">수정 {{ note.updated_at|display_time }}</span>
+                </a></li>
+              {% endfor %}
+            </ol>
+          {% else %}
+            <div class="empty-state"><p class="lead">아직 메모가 없어요.<br>떠오른 생각을 첫 메모로 남겨 보세요.</p></div>
+          {% endif %}
+        {% elif page == "note_form" %}
+          <p class="eyebrow">내 메모</p>
+          <h1 id="page-title">{{ title }}</h1>
+          {% if error %}<p class="message error" role="alert">{{ error }}</p>{% endif %}
+          <form class="auth-form" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="field">
+              <label for="note-title">제목</label>
+              <input id="note-title" name="title" value="{{ form_title }}" required maxlength="{{ note_title_max_length }}">
+            </div>
+            <div class="field">
+              <label for="note-content">내용</label>
+              <textarea id="note-content" name="content" required maxlength="{{ note_content_max_length }}" aria-describedby="content-hint">{{ form_content }}</textarea>
+              <small id="content-hint" class="hint">내용은 최대 {{ '{:,}'.format(note_content_max_length) }}자까지 저장할 수 있어요.</small>
+            </div>
+            <div class="inline-actions">
+              <a class="button secondary" href="{{ cancel_url }}">취소</a>
+              <button class="button primary" type="submit">저장</button>
+            </div>
+          </form>
+        {% elif page == "note_detail" %}
+          <p class="eyebrow">내 메모</p>
+          <h1 id="page-title">{{ note.title }}</h1>
+          <p class="note-meta">작성 {{ note.created_at|display_time }}<br>수정 {{ note.updated_at|display_time }}</p>
+          {% if notice %}<p class="message notice" role="status">{{ notice }}</p>{% endif %}
+          <div class="note-content">{{ note.content }}</div>
+          <div class="inline-actions">
+            <a class="button secondary" href="{{ url_for('list_notes') }}">목록</a>
+            <a class="button primary" href="{{ url_for('edit_note', note_id=note.id) }}">수정</a>
+            <a class="button secondary" href="{{ url_for('delete_note', note_id=note.id) }}">삭제</a>
+          </div>
+        {% elif page == "note_delete" %}
+          <p class="eyebrow">메모 삭제</p>
+          <h1 id="page-title">이 메모를 삭제할까요?</h1>
+          <p class="lead">{{ note.title }}</p>
+          <p class="hint">삭제한 메모는 복구할 수 없어요.</p>
+          <form method="post" class="inline-actions">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <a class="button secondary" href="{{ url_for('view_note', note_id=note.id) }}">취소</a>
+            <button class="button danger" type="submit">메모 삭제</button>
+          </form>
+        {% elif page == "admin" %}
+          <p class="eyebrow">관리자</p>
+          <h1 id="page-title">회원 관리</h1>
+          <p class="lead">전체 회원 {{ total }}명</p>
+          <div class="table-wrap">
+            <table aria-label="전체 회원 목록">
+              <thead><tr><th scope="col">번호</th><th scope="col">아이디</th><th scope="col">역할</th></tr></thead>
+              <tbody>{% for member in members %}
+                <tr><td>{{ member.id }}</td><td class="member-name">{{ member.username }}</td><td class="role-label">{{ '관리자' if member.is_admin else '회원' }}</td></tr>
+              {% endfor %}</tbody>
+            </table>
+          </div>
         {% elif page == "home" %}
           {% if username %}
             <p class="eyebrow">로그인 상태</p>
@@ -196,6 +326,13 @@ PAGE = """<!doctype html>
             <p class="switch">계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></p>
           {% endif %}
         {% endif %}
+        {% if page in ['notes', 'admin'] and pages > 1 %}
+          <nav class="pagination" aria-label="페이지 이동">
+            {% if number > 1 %}<a class="button secondary compact" href="{{ url_for('admin_users' if page == 'admin' else 'list_notes', page=number-1) }}">이전</a>{% else %}<span></span>{% endif %}
+            <span class="hint" aria-current="page">{{ number }} / {{ pages }} 페이지</span>
+            {% if number < pages %}<a class="button secondary compact" href="{{ url_for('admin_users' if page == 'admin' else 'list_notes', page=number+1) }}">다음</a>{% else %}<span></span>{% endif %}
+          </nav>
+        {% endif %}
       </section>
     </main>
   </div>
@@ -229,7 +366,8 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL
+                password_hash TEXT NOT NULL,
+                is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))
             );
             CREATE TABLE IF NOT EXISTS auth_sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -243,7 +381,42 @@ def init_db():
                 resets_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS auth_limits_expiry ON auth_limits(resets_at);
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+                content TEXT NOT NULL CHECK (length(content) BETWEEN 1 AND 10000),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS notes_owner_updated ON notes(user_id, updated_at DESC, id DESC);
         """)
+        with db:
+            # Serialize schema migration and bootstrap across application workers.
+            db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+            if "is_admin" not in columns:
+                db.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))")
+            admin = db.execute("SELECT id, is_admin FROM users WHERE username = ?", ("admin",)).fetchone()
+            if admin is not None:
+                if not admin["is_admin"]:
+                    raise RuntimeError("An existing non-admin account uses the reserved admin name. Resolve the conflict before initialization.")
+                return
+            admin_password = os.environ.get("ADMIN_PASSWORD", "")
+            if not PASSWORD_MIN_LENGTH <= len(admin_password) <= PASSWORD_MAX_LENGTH:
+                raise RuntimeError("First launch requires ADMIN_PASSWORD with 15-128 characters.")
+            admin_note = os.environ.get("ADMIN_NOTE") or f"SBOB{{daewon_{secrets.token_hex(12)}}}"
+            if re.fullmatch(r"SBOB\{[A-Za-z0-9_.:-]{1,100}\}", admin_note) is None:
+                raise RuntimeError("ADMIN_NOTE must have the form SBOB{your_identifier}.")
+            admin_id = db.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                ("admin", generate_password_hash(admin_password)),
+            ).lastrowid
+            now = int(time.time())
+            db.execute(
+                "INSERT INTO notes (user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (admin_id, "관리자 개인 메모", admin_note, now, now),
+            )
 
 
 def token_digest(token):
@@ -279,9 +452,13 @@ def prepare_request():
     if app.config["PRODUCTION"] and not request.is_secure:
         abort(400)
     if request.method == "POST":
+        if request.endpoint not in {"create_note", "edit_note"}:
+            request.max_content_length = 16 * 1024
         if request.mimetype != "application/x-www-form-urlencoded":
             abort(415)
-        fields = {"csrf_token"} if request.endpoint == "logout" else {"csrf_token", "username", "password"}
+        fields = POST_FIELDS.get(request.endpoint)
+        if fields is None:
+            abort(405)
         if set(request.form) != fields or any(len(request.form.getlist(field)) != 1 for field in fields):
             abort(400)
         check_csrf()
@@ -297,7 +474,7 @@ def prepare_request():
     db = get_db()
     digest = token_digest(token)
     g.user = db.execute(
-        "SELECT users.id, users.username FROM auth_sessions "
+        "SELECT users.id, users.username, users.is_admin FROM auth_sessions "
         "JOIN users ON users.id = auth_sessions.user_id "
         "WHERE auth_sessions.token_hash = ? AND auth_sessions.expires_at > ?",
         (digest, int(time.time())),
@@ -329,6 +506,7 @@ def secure_response(response):
 def safe_error_response(error):
     messages = {
         400: "요청을 확인할 수 없습니다. 페이지를 새로 열고 다시 시도해 주세요.",
+        403: "이 페이지에 접근할 권한이 없습니다.",
         404: "요청한 페이지를 찾을 수 없습니다.",
         405: "지원하지 않는 요청 방식입니다.",
         413: "입력한 데이터가 너무 큽니다.",
@@ -361,7 +539,7 @@ def check_csrf():
         abort(400)
 
 
-def page(name, title, *, username=None, error=None, notice=None, status=200):
+def page(name, title, *, username=None, error=None, notice=None, status=200, **context):
     return (
         render_template_string(
             PAGE,
@@ -374,13 +552,69 @@ def page(name, title, *, username=None, error=None, notice=None, status=200):
             csp_nonce=g.csp_nonce,
             password_min_length=PASSWORD_MIN_LENGTH,
             password_max_length=PASSWORD_MAX_LENGTH,
+            current_user=g.user,
+            note_title_max_length=NOTE_TITLE_MAX_LENGTH,
+            note_content_max_length=NOTE_CONTENT_MAX_LENGTH,
+            **context,
         ),
         status,
     )
 
 
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.user is None:
+            return redirect(url_for("login"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def owned_note(note_id):
+    if not 1 <= note_id <= 2**63 - 1:
+        abort(404)
+    note = get_db().execute(
+        "SELECT id, title, content, created_at, updated_at FROM notes WHERE id = ? AND user_id = ?",
+        (note_id, g.user["id"]),
+    ).fetchone()
+    if note is None:
+        abort(404)
+    return note
+
+
+def pagination(total):
+    values = request.args.getlist("page") or ["1"]
+    if len(values) != 1 or re.fullmatch(r"[1-9][0-9]{0,8}", values[0]) is None:
+        abort(400)
+    number = int(values[0])
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if number > pages:
+        abort(404)
+    return number, pages
+
+
+def read_note_form():
+    title = request.form["title"].strip()
+    content = request.form["content"]
+    error = None
+    if not 1 <= len(title) <= NOTE_TITLE_MAX_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in title):
+        error = f"제목은 줄바꿈 없이 1~{NOTE_TITLE_MAX_LENGTH}자로 입력해 주세요."
+    elif not content.strip() or len(content) > NOTE_CONTENT_MAX_LENGTH:
+        error = f"내용은 공백만으로 작성할 수 없으며 {NOTE_CONTENT_MAX_LENGTH:,}자까지 입력할 수 있어요."
+    elif any(ord(char) < 32 and char not in "\r\n\t" for char in content):
+        error = "내용에 사용할 수 없는 제어 문자가 포함되어 있어요."
+    return title, content, error
+
+
+@app.template_filter("display_time")
+def display_time(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=9))).strftime("%Y.%m.%d %H:%M KST")
+
+
 @app.route("/")
 def index():
+    if g.user is not None:
+        return redirect(url_for("list_notes"))
     return page("home", "홈", username=g.user["username"] if g.user else None)
 
 
@@ -391,6 +625,8 @@ def register():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        if username.casefold() == "admin":
+            return page("register", "회원가입", error="사용할 수 없는 아이디입니다.", status=400)
         if not 3 <= len(username) <= 30 or not all(char.isalnum() or char in "_.-" for char in username):
             return page("register", "회원가입", error="아이디는 3~30자의 글자, 숫자, 밑줄, 점, 하이픈으로 입력하세요.", status=400)
         if not PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH:
@@ -398,7 +634,7 @@ def register():
         db = get_db()
         try:
             db.execute(
-                "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
                 (username, generate_password_hash(password)),
             )
             db.commit()
@@ -458,9 +694,111 @@ def logout():
     return redirect(url_for("login", logged_out=1))
 
 
+@app.get("/notes")
+@login_required
+def list_notes():
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM notes WHERE user_id = ?", (g.user["id"],)).fetchone()[0]
+    number, pages = pagination(total)
+    notes = db.execute(
+        "SELECT id, title, substr(content, 1, 160) AS preview, updated_at FROM notes "
+        "WHERE user_id = ? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+        (g.user["id"], PAGE_SIZE, (number - 1) * PAGE_SIZE),
+    ).fetchall()
+    return page(
+        "notes", "내 메모", notes=notes, total=total, number=number, pages=pages,
+        notice="메모를 삭제했어요." if request.args.get("deleted") == "1" else None,
+    )
+
+
+@app.route("/notes/new", methods=["GET", "POST"])
+@login_required
+def create_note():
+    title, content, error = "", "", None
+    if request.method == "POST":
+        title, content, error = read_note_form()
+        if error is None:
+            now = int(time.time())
+            db = get_db()
+            with db:
+                note_id = db.execute(
+                    "INSERT INTO notes (user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (g.user["id"], title, content, now, now),
+                ).lastrowid
+            return redirect(url_for("view_note", note_id=note_id, saved=1))
+    return page(
+        "note_form", "새 메모", form_title=title, form_content=content,
+        cancel_url=url_for("list_notes"), error=error, status=400 if error else 200,
+    )
+
+
+@app.get("/notes/<int:note_id>")
+@login_required
+def view_note(note_id):
+    return page(
+        "note_detail", "메모 상세", note=owned_note(note_id),
+        notice="메모를 저장했어요." if request.args.get("saved") == "1" else None,
+    )
+
+
+@app.route("/notes/<int:note_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_note(note_id):
+    note = owned_note(note_id)
+    title, content, error = note["title"], note["content"], None
+    if request.method == "POST":
+        title, content, error = read_note_form()
+        if error is None:
+            db = get_db()
+            with db:
+                result = db.execute(
+                    "UPDATE notes SET title = ?, content = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                    (title, content, int(time.time()), note_id, g.user["id"]),
+                )
+                if result.rowcount != 1:
+                    abort(404)
+            return redirect(url_for("view_note", note_id=note_id, saved=1))
+    return page(
+        "note_form", "메모 수정", form_title=title, form_content=content,
+        cancel_url=url_for("view_note", note_id=note_id), error=error, status=400 if error else 200,
+    )
+
+
+@app.route("/notes/<int:note_id>/delete", methods=["GET", "POST"])
+@login_required
+def delete_note(note_id):
+    note = owned_note(note_id)
+    if request.method == "POST":
+        db = get_db()
+        with db:
+            result = db.execute("DELETE FROM notes WHERE id = ? AND user_id = ?", (note_id, g.user["id"]))
+            if result.rowcount != 1:
+                abort(404)
+        return redirect(url_for("list_notes", deleted=1))
+    return page("note_delete", "메모 삭제", note=note)
+
+
+@app.get("/admin")
+@login_required
+def admin_users():
+    if not g.user["is_admin"]:
+        abort(403)
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    number, pages = pagination(total)
+    members = db.execute(
+        "SELECT id, username, is_admin FROM users ORDER BY id LIMIT ? OFFSET ?",
+        (PAGE_SIZE, (number - 1) * PAGE_SIZE),
+    ).fetchall()
+    return page("admin", "회원 관리", members=members, total=total, number=number, pages=pages)
+
+
 init_db()
 
 if __name__ == "__main__":
     if production:
         raise RuntimeError("Use a production WSGI server with HTTPS instead of app.run().")
-    app.run(host="127.0.0.1", debug=False)
+    port = os.environ.get("PORT", "5001")
+    if re.fullmatch(r"[0-9]{1,5}", port) is None or not 1 <= int(port) <= 65535:
+        raise RuntimeError("PORT must be an integer between 1 and 65535.")
+    app.run(host="127.0.0.1", port=int(port), debug=False)

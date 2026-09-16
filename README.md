@@ -22,7 +22,7 @@ python3 -m venv .venv
 
 구성은 `브라우저 → Caddy(HTTPS) → Gunicorn → Flask → SQLite`입니다. 외부에는 Caddy의 80·443번 포트만 공개하며 앱의 8000번 포트는 내부 Docker 네트워크에서만 사용합니다. 앱은 일반 사용자 UID/GID `10001:10001`로 실행하고 코드 파일 시스템은 읽기 전용으로 둡니다.
 
-첫 Docker 실행은 프로젝트 폴더에서 아래 명령으로 시작합니다. 서버의 **IPv4 주소 또는 접속할 도메인 하나**를 입력하면 `.env.example`을 바탕으로 `.env`를 권한 600으로 만들고 `SECRET_KEY`와 초기 `ADMIN_PASSWORD`를 각각 무작위로 생성한 뒤 Docker Compose를 실행합니다. 생성된 값은 터미널에 한 번만 표시됩니다. 관리자 아이디는 `admin`입니다. 이 값들을 채팅·스크린샷·Git에 올리지 마세요.
+첫 Docker 실행은 프로젝트 폴더에서 아래 명령으로 시작합니다. 서버의 **IPv4 주소 또는 접속할 도메인 하나**를 입력하면 `.env.example`을 바탕으로 `.env`를 권한 600으로 만들고 `SECRET_KEY`와 초기 `ADMIN_PASSWORD`를 각각 무작위로 생성합니다. `Caddyfile`이 없으면 `Caddyfile.example`에서 복사한 뒤 Docker Compose를 실행합니다. 생성된 비밀 값은 터미널에 한 번만 표시됩니다. 관리자 아이디는 `admin`입니다. 이 값들을 채팅·스크린샷·Git에 올리지 마세요.
 
 `docker compose up`은 이 Python 스크립트를 자동으로 호출하지 않습니다. **처음에는 아래 Python 명령을 실행**해야 하며, 이 명령이 설정을 만든 뒤 `docker compose up -d --build`까지 실행합니다. `.env`가 준비된 이후에는 Docker Compose 명령을 직접 사용할 수 있습니다.
 
@@ -31,6 +31,8 @@ python3 docker_setup.py
 ```
 
 `SITE_ADDRESS`에는 `https://`, 경로, 포트 없이 서버 IPv4 주소 또는 도메인을 넣습니다. Compose가 이 주소를 Flask의 `TRUSTED_HOSTS`와 Caddy 설정에 동일하게 적용합니다. `.env`는 Git과 이미지 빌드 대상에서 제외되므로 GitHub에서 내려받은 새 서버에서도 이 명령을 실행해야 합니다.
+
+`Caddyfile`은 서버별 설정으로 Git에서 제외합니다. 저장소의 `Caddyfile.example`은 새 서버의 기본 설정이며, 이미 있는 `Caddyfile`은 초기 설정과 CD 배포에서 유지합니다. 예제 파일을 나중에 바꿔도 서버 파일에는 자동 반영되지 않습니다. `.env`만 만든 뒤 Compose를 직접 실행할 때는 `Caddyfile`이 없으면 `cp Caddyfile.example Caddyfile`을 먼저 실행하세요.
 
 이미 `.env`가 있으면 비밀키와 관리자 비밀번호를 유지합니다. `SITE_ADDRESS=localhost`인 경우 새 주소를 묻고, 주소를 나중에 바꾸려면 `python3 docker_setup.py --site-address memo.example.com`을 실행합니다. 이 명령은 변경된 설정으로 컨테이너를 다시 생성합니다. `.env`만 준비하려면 `--configure-only`를 사용할 수 있습니다. Docker의 기존 DB에서는 `.env`의 `ADMIN_PASSWORD`를 바꿔도 실제 관리자 계정 비밀번호가 변경되지 않습니다. 로그인 후 앱의 **비밀번호 변경** 화면에서 변경하세요. 로컬 실행용 `.admin-initial-password`와는 별개입니다.
 

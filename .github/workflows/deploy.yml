@@ -16,6 +16,20 @@ jobs:
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
             set -e
-            cd study
-            git pull
+            cd "$HOME/study"
+            if git ls-files --error-unmatch Caddyfile >/dev/null 2>&1; then
+              caddy_backup="$(mktemp)"
+              cp Caddyfile "$caddy_backup"
+              trap 'cp "$caddy_backup" Caddyfile; rm -f "$caddy_backup"' EXIT
+              git restore --staged --worktree -- Caddyfile
+              git pull --ff-only
+              cp "$caddy_backup" Caddyfile
+              rm -f "$caddy_backup"
+              trap - EXIT
+            else
+              git pull --ff-only
+            fi
+            if [ ! -f Caddyfile ]; then
+              cp Caddyfile.example Caddyfile
+            fi
             docker compose up -d --build

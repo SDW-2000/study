@@ -141,6 +141,24 @@ def show_generated(generated, output=print):
         output("관리자 아이디: admin (기존 DB의 관리자 비밀번호는 변경되지 않습니다.)")
 
 
+def ensure_caddyfile(root):
+    path = root / "Caddyfile"
+    if path.is_symlink():
+        raise ValueError("Caddyfile이 심볼릭 링크입니다. 일반 파일로 바꾼 뒤 다시 실행하세요.")
+    if path.exists():
+        if not path.is_file():
+            raise ValueError("Caddyfile이 일반 파일이 아닙니다.")
+        return False
+    template = (root / "Caddyfile.example").read_bytes()
+    with path.open("xb") as file:
+        try:
+            file.write(template)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+    return True
+
+
 def start_compose(root, force_recreate=False):
     environment = os.environ.copy()
     for key in COMPOSE_KEYS:
@@ -162,6 +180,8 @@ def main(argv=None):
     try:
         address, changed, generated = configure(root, requested_site=args.site_address)
         if not args.configure_only:
+            if ensure_caddyfile(root):
+                print("Caddyfile.example에서 Caddyfile을 만들었습니다.")
             start_compose(root, force_recreate=changed)
             print(f"접속 주소: https://{address}")
     except (ValueError, EOFError, FileNotFoundError, subprocess.CalledProcessError, OSError) as error:

@@ -20,7 +20,6 @@ class DockerSetupTests(unittest.TestCase):
             "HTTP_PORT=80\nHTTPS_PORT=443\nBIND_IP=0.0.0.0\n",
             encoding="utf-8",
         )
-        self.root.joinpath("Caddyfile.example").write_text("example Caddy config\n", encoding="utf-8")
 
     def test_first_setup_creates_private_env_and_displays_credentials_once(self):
         messages = []
@@ -73,14 +72,6 @@ class DockerSetupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             docker_setup.configure(self.root, requested_site="https://example.com:443")
         self.assertFalse((self.root / ".env").exists())
-
-    def test_caddyfile_is_created_once_and_existing_settings_are_preserved(self):
-        path = self.root / "Caddyfile"
-        self.assertTrue(docker_setup.ensure_caddyfile(self.root))
-        self.assertEqual(path.read_text(encoding="utf-8"), "example Caddy config\n")
-        path.write_text("server-specific Caddy config\n", encoding="utf-8")
-        self.assertFalse(docker_setup.ensure_caddyfile(self.root))
-        self.assertEqual(path.read_text(encoding="utf-8"), "server-specific Caddy config\n")
 
     def test_first_run_displays_password_after_compose_output(self):
         output = io.StringIO()

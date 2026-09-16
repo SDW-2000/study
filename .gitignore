@@ -33,7 +33,6 @@ backups/
 certs/
 caddy_data/
 caddy_config/
-/Caddyfile
 memo-root.crt
 
 # Local logs and macOS metadata

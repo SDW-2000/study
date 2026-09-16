@@ -17,19 +17,16 @@ jobs:
           script: |
             set -e
             cd "$HOME/study"
-            if git ls-files --error-unmatch Caddyfile >/dev/null 2>&1; then
-              caddy_backup="$(mktemp)"
-              cp Caddyfile "$caddy_backup"
-              trap 'cp "$caddy_backup" Caddyfile; rm -f "$caddy_backup"' EXIT
-              git restore --staged --worktree -- Caddyfile
-              git pull --ff-only
-              cp "$caddy_backup" Caddyfile
-              rm -f "$caddy_backup"
-              trap - EXIT
-            else
-              git pull --ff-only
+            caddy_migration_backup=""
+            if [ -f Caddyfile ] && ! git ls-files --error-unmatch Caddyfile >/dev/null 2>&1; then
+              caddy_migration_backup="$(mktemp)"
+              cp Caddyfile "$caddy_migration_backup"
+              rm Caddyfile
+              trap 'if [ ! -f Caddyfile ]; then cp "$caddy_migration_backup" Caddyfile; fi; rm -f "$caddy_migration_backup"' EXIT
             fi
-            if [ ! -f Caddyfile ]; then
-              cp Caddyfile.example Caddyfile
+            git pull --ff-only
+            if [ -n "$caddy_migration_backup" ]; then
+              rm -f "$caddy_migration_backup"
+              trap - EXIT
             fi
             docker compose up -d --build

@@ -8,11 +8,14 @@ Use a production WSGI server; configure HTTPS at the server or trusted proxy.
 """
 
 import hashlib
+import ipaddress
 import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
+import unicodedata
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -37,6 +40,9 @@ if production and (not secret_key or not trusted_hosts):
 trust_proxy = os.environ.get("TRUST_PROXY", "0")
 if trust_proxy not in {"0", "1"}:
     raise RuntimeError("TRUST_PROXY must be 0 or 1.")
+audit_retention_days = os.environ.get("AUDIT_RETENTION_DAYS", "90")
+if re.fullmatch(r"[0-9]{1,3}", audit_retention_days) is None or not 7 <= int(audit_retention_days) <= 365:
+    raise RuntimeError("AUDIT_RETENTION_DAYS must be an integer between 7 and 365.")
 
 PASSWORD_MIN_LENGTH = 15
 PASSWORD_MAX_LENGTH = 128
@@ -44,7 +50,21 @@ NOTE_TITLE_MAX_LENGTH = 120
 NOTE_CONTENT_MAX_LENGTH = 10000
 NOTE_TIMEZONE = timezone(timedelta(hours=9))
 PAGE_SIZE = 20
+AUDIT_PAGE_SIZE = 50
 TOKEN_PATTERN = re.compile(r"[0-9a-f]{64}")
+REQUEST_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+AUDIT_EVENT_TYPES = {
+    "auth.login", "auth.logout", "account.register", "account.password_change",
+    "admin.member_password_change", "authorization.admin_denied",
+    "note.create", "note.update", "note.delete",
+}
+AUDIT_OUTCOMES = {"success", "failure", "denied", "rate_limited"}
+AUDIT_CHANNELS = {"web", "api"}
+AUDIT_REASON_CODES = {
+    None, "invalid_input", "invalid_credentials", "username_conflict",
+    "current_password_mismatch", "confirmation_mismatch", "password_reused",
+    "concurrent_change", "rate_limit", "admin_required",
+}
 AUTH_LIMITS = {
     "login": (10, 300), "register": (5, 3600),
     "change_password": (5, 300), "admin_change_password": (5, 300),
@@ -66,6 +86,7 @@ app = Flask(__name__, static_folder="static")
 app.config.update(
     SECRET_KEY=secret_key or secrets.token_hex(32),
     DATABASE=os.environ.get("DATABASE_PATH") or str(Path(__file__).with_name("users.db")),
+    AUDIT_RETENTION_DAYS=int(audit_retention_days),
     PRODUCTION=production,
     DEBUG=False,
     TRUSTED_HOSTS=trusted_hosts or ["localhost", "127.0.0.1", "[::1]"],
@@ -80,6 +101,8 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
+audit_cleanup_lock = threading.Lock()
+audit_cleanup_deadline = 0.0
 if trust_proxy == "1":
     # Only enable behind the single Caddy proxy on the private Docker network.
     # Caddy replaces client-supplied forwarding headers; port 8000 is not published.
@@ -92,6 +115,7 @@ PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} · 메모</title>
   <link rel="icon" href="{{ '/static/favicon.ico' if page == 'error' else url_for('static', filename='favicon.ico') }}" type="image/x-icon">
+  {% if page == 'audit' %}<script defer src="{{ url_for('static', filename='admin_audit.js') }}"></script>{% endif %}
   <style nonce="{{ csp_nonce }}">
     :root {
       color-scheme: light;
@@ -114,10 +138,11 @@ PAGE = """<!doctype html>
     body { min-height: 100svh; margin: 0; background: var(--background); color: var(--text); }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible {
+    a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible {
       outline: 3px solid var(--focus);
       outline-offset: 3px;
     }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
     .shell { width: min(100%, 72rem); min-height: 100svh; margin: auto; padding: 1.5rem clamp(1.25rem, 4vw, 3rem); display: flex; flex-direction: column; }
     .site-header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .6rem 0; background: var(--toolbar); backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%); }
     .brand { display: inline-flex; align-items: center; min-height: 2.75rem; flex-shrink: 0; color: var(--text); font-size: 1.25rem; font-weight: 720; letter-spacing: -0.035em; }
@@ -135,6 +160,7 @@ PAGE = """<!doctype html>
     .field + .field { margin-top: 1.2rem; }
     label { display: block; margin-bottom: .5rem; font-size: .91rem; font-weight: 650; }
     input:not([type="hidden"]) { width: 100%; min-height: 3.15rem; padding: .75rem .95rem; border: 1px solid var(--border); border-radius: .85rem; background: var(--surface); color: var(--text); font: inherit; transition: border-color 150ms ease, box-shadow 150ms ease; }
+    select { width: 100%; min-height: 2.8rem; padding: .6rem 2rem .6rem .8rem; border: 1px solid var(--border); border-radius: .75rem; background-color: var(--surface); color: var(--text); font: inherit; }
     input:not([type="hidden"]):focus { border-color: var(--focus); box-shadow: 0 0 0 3px rgba(0, 122, 255, .13); outline: none; }
     input:not([type="hidden"]):focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
     .hint { display: block; margin-top: .5rem; color: var(--muted); font-size: .82rem; }
@@ -155,6 +181,7 @@ PAGE = """<!doctype html>
     .button.compact { min-height: 2.75rem; padding: .5rem .9rem; font-size: .9rem; }
     main.workspace { place-items: start center; }
     .panel-wide { width: min(100%, 52rem); min-width: 0; }
+    .panel-audit { width: 100%; min-width: 0; padding: clamp(1.25rem, 3vw, 2rem); }
     .section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1.5rem; }
     .section-heading > div { min-width: 0; }
     .note-list { list-style: none; padding: 0; margin: 2rem 0 0; }
@@ -183,6 +210,45 @@ PAGE = """<!doctype html>
     th, td { padding: 1rem .5rem; border-bottom: 1px solid var(--border); }
     td.member-name { overflow-wrap: anywhere; }
     .role-label { white-space: nowrap; font-size: .9rem; }
+    .audit-heading-tools { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: .6rem; }
+    .audit-status { display: inline-flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: var(--muted); font-size: .82rem; font-weight: 650; white-space: nowrap; }
+    .audit-status::before { width: .5rem; height: .5rem; border-radius: 50%; background: #218739; content: ""; box-shadow: 0 0 0 3px rgba(33, 135, 57, .12); }
+    .audit-status[data-state="paused"]::before { background: #9b6a00; box-shadow: 0 0 0 3px rgba(155, 106, 0, .12); }
+    .audit-status[data-state="error"]::before { background: #b42318; box-shadow: 0 0 0 3px rgba(180, 35, 24, .12); }
+    .audit-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 2rem 0 0; border: 1px solid var(--border); border-radius: 1rem; overflow: hidden; }
+    .audit-metric { min-width: 0; padding: 1rem 1.1rem; background: var(--background); }
+    .audit-metric + .audit-metric { border-left: 1px solid var(--border); }
+    .audit-metric dt { color: var(--muted); font-size: .8rem; font-weight: 650; }
+    .audit-metric dd { margin: .3rem 0 0; font-size: 1.65rem; font-weight: 720; line-height: 1.15; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+    .audit-filters { margin-top: 1.25rem; padding: 1rem; border: 0; border-radius: 1rem; background: var(--background); }
+    .audit-filter-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .8rem; }
+    .audit-filter-grid label { font-size: .78rem; }
+    .audit-filter-actions { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; margin-top: 1rem; }
+    .audit-table { table-layout: fixed; }
+    .audit-table th:nth-child(1) { width: 9.5rem; }
+    .audit-table th:nth-child(2) { width: 5rem; }
+    .audit-table th:nth-child(3) { width: 10rem; }
+    .audit-table th:nth-child(5) { width: 9rem; }
+    .audit-table th:nth-child(6) { width: 4.5rem; }
+    .audit-table td { vertical-align: top; font-size: .9rem; overflow-wrap: anywhere; }
+    .audit-time, .audit-ip { white-space: nowrap; font-size: .82rem; font-variant-numeric: tabular-nums; }
+    .audit-secondary { display: block; margin-top: .25rem; color: var(--muted); font-size: .77rem; line-height: 1.45; }
+    .audit-badge { display: inline-flex; align-items: center; gap: .35rem; min-height: 1.7rem; padding: .18rem .55rem; border-radius: 999px; font-size: .77rem; font-weight: 700; white-space: nowrap; }
+    .audit-badge::before { width: .42rem; height: .42rem; border-radius: 50%; content: ""; background: currentColor; }
+    .audit-badge.success { color: #18732d; background: #eaf7ed; }
+    .audit-badge.failure { color: #a1261c; background: #fff0ef; }
+    .audit-badge.denied, .audit-badge.rate_limited { color: #805900; background: #fff7df; }
+    .audit-detail summary { display: inline-flex; min-height: 2.75rem; align-items: center; color: var(--accent); font-weight: 650; cursor: pointer; touch-action: manipulation; }
+    .audit-detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .4rem .7rem; min-width: 16rem; margin: .25rem 0 .75rem; padding: .8rem; border-radius: .75rem; background: var(--background); font-size: .78rem; }
+    .audit-detail dt { color: var(--muted); font-weight: 650; }
+    .audit-detail dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+    .audit-empty { padding: 3rem 1rem; color: var(--muted); text-align: center; }
+    @media (max-width: 52rem) {
+      .audit-filter-grid, .audit-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .audit-metric:nth-child(3) { border-left: 0; }
+      .audit-metric:nth-child(n+3) { border-top: 1px solid var(--border); }
+      .audit-table th:nth-child(5), .audit-table td:nth-child(5) { display: none; }
+    }
     @media (max-width: 30rem) {
       .shell { padding: 1.1rem 1rem; }
       main { padding: 2rem 0; }
@@ -192,16 +258,25 @@ PAGE = """<!doctype html>
       .account-nav > a { padding-inline: .6rem; }
       .account-nav .button.compact { padding-inline: .65rem; }
       .section-heading > .button { width: 100%; }
+      .audit-heading-tools { width: 100%; justify-content: flex-start; }
+      .audit-filter-grid, .audit-summary { grid-template-columns: 1fr; }
+      .audit-metric + .audit-metric { border-left: 0; border-top: 1px solid var(--border); }
+      .audit-table th:nth-child(1), .audit-table td:nth-child(1) { width: 7rem; }
+      .audit-table th:nth-child(4), .audit-table td:nth-child(4) { display: none; }
     }
     @media (prefers-color-scheme: dark) {
       :root { color-scheme: dark; --background: #111113; --surface: #1c1c1e; --text: #f5f5f7; --muted: #b0b0b7; --border: #45454a; --accent: #64b5ff; --focus: #64b5ff; --message: #172b40; --error: #39201f; --toolbar: rgba(17, 17, 19, .9); }
       .panel { box-shadow: 0 1.25rem 3rem rgba(0, 0, 0, .18); }
       .button.primary { color: #fff; }
+      .audit-badge.success { color: #7fdda0; background: #173622; }
+      .audit-badge.failure { color: #ffaaa3; background: #40201e; }
+      .audit-badge.denied, .audit-badge.rate_limited { color: #f2ca6e; background: #3a2e12; }
     }
     @media (prefers-contrast: more) {
-      .panel, input:not([type="hidden"]), textarea, .button.secondary { border: 2px solid var(--text); }
+      .panel, input:not([type="hidden"]), select, textarea, .button.secondary { border: 2px solid var(--text); }
       .lead, .hint, .switch, .site-label, .note-meta, .preview, .empty-content { color: var(--text); }
       .site-header { background: var(--background); backdrop-filter: none; -webkit-backdrop-filter: none; border-bottom: 2px solid var(--text); }
+      .audit-badge { border: 1px solid currentColor; }
     }
     @media (prefers-reduced-transparency: reduce) {
       .site-header { background: var(--background); backdrop-filter: none; -webkit-backdrop-filter: none; }
@@ -221,6 +296,7 @@ PAGE = """<!doctype html>
           <a href="{{ url_for('list_notes') }}"{% if page in ['notes', 'note_form', 'note_detail', 'note_delete'] %} aria-current="{{ 'page' if page == 'notes' else 'true' }}"{% endif %}>내 메모</a>
           <a href="{{ url_for('change_password') }}"{% if page == 'password_change' and not admin_action %} aria-current="page"{% endif %}>비밀번호 변경</a>
           {% if current_user.is_admin %}<a href="{{ url_for('admin_users') }}"{% if page == 'admin' or (page == 'password_change' and admin_action) %} aria-current="{{ 'page' if page == 'admin' else 'true' }}"{% endif %}>회원 관리</a>{% endif %}
+          {% if current_user.is_admin %}<a href="{{ url_for('admin_audit') }}"{% if page == 'audit' %} aria-current="page"{% endif %}>활동 기록</a>{% endif %}
           <form method="post" action="{{ url_for('logout') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="button secondary compact" type="submit">로그아웃</button>
@@ -230,8 +306,8 @@ PAGE = """<!doctype html>
         <span class="site-label">나의 공간</span>
       {% endif %}
     </header>
-    <main{% if page in ['notes', 'note_form', 'note_detail', 'admin'] %} class="workspace"{% endif %}>
-      <section class="panel{% if page in ['notes', 'note_form', 'note_detail', 'admin'] %} panel-wide{% endif %}" aria-labelledby="page-title">
+    <main id="main-content"{% if page in ['notes', 'note_form', 'note_detail', 'admin', 'audit'] %} class="workspace"{% endif %}>
+      <section class="panel{% if page in ['notes', 'note_form', 'note_detail', 'admin'] %} panel-wide{% elif page == 'audit' %} panel-audit{% endif %}" aria-labelledby="page-title">
         {% if page == "error" %}
           <p class="eyebrow">요청 안내</p>
           <h1 id="page-title">{{ title }}</h1>
@@ -315,6 +391,67 @@ PAGE = """<!doctype html>
               {% endfor %}</tbody>
             </table>
           </div>
+        {% elif page == "audit" %}
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">관리자</p>
+              <h1 id="page-title">활동 기록</h1>
+              <p class="lead">최근 {{ retention_days }}일간 로그인과 주요 변경 이력을 확인합니다.</p>
+            </div>
+            <div class="audit-heading-tools">
+              <span id="audit-status" class="audit-status" data-state="{{ 'live' if poll_url else 'paused' }}" role="status" aria-live="polite">{{ '자동 갱신 중' if poll_url else '과거 기록 보기' }}</span>
+              {% if poll_url %}<button id="audit-pause" class="button secondary compact" type="button" aria-pressed="false">일시정지</button>{% endif %}
+              <button id="audit-refresh" class="button secondary compact" type="button">새로고침</button>
+            </div>
+          </div>
+          <dl class="audit-summary" aria-label="최근 24시간 요약">
+            <div class="audit-metric"><dt>로그인 성공</dt><dd id="metric-login-success">{{ summary.login_success }}</dd></div>
+            <div class="audit-metric"><dt>로그인 실패·제한</dt><dd id="metric-login-failure">{{ summary.login_failure }}</dd></div>
+            <div class="audit-metric"><dt>활동 사용자</dt><dd id="metric-active-users">{{ summary.active_users }}</dd></div>
+            <div class="audit-metric"><dt>권한 거부</dt><dd id="metric-denied">{{ summary.denied }}</dd></div>
+          </dl>
+          <form class="audit-filters" method="get" action="{{ url_for('admin_audit') }}">
+            <div class="audit-filter-grid">
+              <div><label for="audit-period">기간</label><select id="audit-period" name="period">{% for value, label in filter_labels.period.items() %}<option value="{{ value }}"{% if filters.period == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+              <div><label for="audit-outcome">결과</label><select id="audit-outcome" name="outcome">{% for value, label in filter_labels.outcome.items() %}<option value="{{ value }}"{% if filters.outcome == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+              <div><label for="audit-category">행동</label><select id="audit-category" name="category">{% for value, label in filter_labels.category.items() %}<option value="{{ value }}"{% if filters.category == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+              <div><label for="audit-username">사용자</label><input id="audit-username" name="username" value="{{ filters.username }}" maxlength="30" placeholder="아이디 정확히 입력" autocomplete="off"></div>
+              <div><label for="audit-ip">IP 주소</label><input id="audit-ip" name="ip" value="{{ filters.ip }}" maxlength="45" placeholder="예: 203.0.113.10" inputmode="text" autocomplete="off" dir="ltr"></div>
+            </div>
+            <div class="audit-filter-actions">
+              <button class="button primary compact" type="submit">필터 적용</button>
+              <a class="button secondary compact" href="{{ url_for('admin_audit') }}">초기화</a>
+              <span class="hint" id="audit-total" data-total="{{ total }}">총 {{ total }}건</span>
+            </div>
+          </form>
+          <div class="table-wrap">
+            <table class="audit-table">
+              <caption class="sr-only">필터된 활동 기록, 최신순</caption>
+              <thead><tr><th scope="col">시각</th><th scope="col">결과</th><th scope="col">행동</th><th scope="col">사용자</th><th scope="col">IP</th><th scope="col">상세</th></tr></thead>
+              <tbody id="audit-events" data-poll-url="{{ poll_url or '' }}" data-latest-id="{{ latest_id }}">
+                {% for event in events %}
+                  <tr data-event-id="{{ event.id }}">
+                    <td><time class="audit-time" datetime="{{ event.created_at }}">{{ event.display_time }}</time></td>
+                    <td><span class="audit-badge {{ event.outcome }}">{{ event.outcome_label }}</span></td>
+                    <td>{{ event.event_label }}<span class="audit-secondary">{{ event.channel }} · {{ event.target }}</span></td>
+                    <td>{{ event.actor }}</td>
+                    <td class="audit-ip" dir="ltr" translate="no">{{ event.source_ip }}</td>
+                    <td><details class="audit-detail"><summary>보기</summary><dl>
+                      <dt>대상</dt><dd>{{ event.target }}</dd><dt>경로</dt><dd>{{ event.channel }}</dd><dt>사유</dt><dd>{{ event.reason }}</dd>
+                      <dt>IP</dt><dd dir="ltr" translate="no">{{ event.source_ip }}</dd><dt>User-Agent</dt><dd>{{ event.user_agent }}</dd>
+                      <dt>요청 ID</dt><dd dir="ltr" translate="no">{{ event.request_id }}</dd>
+                    </dl></details></td>
+                  </tr>
+                {% endfor %}
+                {% if not events %}<tr id="audit-empty"><td class="audit-empty" colspan="6">조건에 맞는 활동 기록이 없습니다.</td></tr>{% endif %}
+              </tbody>
+            </table>
+          </div>
+          {% if pages > 1 %}<nav class="pagination" aria-label="활동 기록 페이지 이동">
+            {% if previous_url %}<a class="button secondary compact" href="{{ previous_url }}">이전</a>{% else %}<span></span>{% endif %}
+            <span class="hint" aria-current="page">{{ number }} / {{ pages }} 페이지</span>
+            {% if next_url %}<a class="button secondary compact" href="{{ next_url }}">다음</a>{% else %}<span></span>{% endif %}
+          </nav>{% endif %}
         {% elif page == "password_change" %}
           <p class="eyebrow">{{ '회원 관리' if admin_action else '내 계정' }}</p>
           <h1 id="page-title">{{ title }}</h1>
@@ -418,35 +555,71 @@ def close_db(_error):
         db.close()
 
 
-def migrate_notes(db, db_path):
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version > 1:
-        raise RuntimeError("The database schema is newer than this application supports.")
-    if version == 1:
+def backup_database(db, db_path, label):
+    if db.execute("SELECT 1 FROM users LIMIT 1").fetchone() is None:
         return
-    if db.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
-        backup_path = db_path.with_name(f"{db_path.name}.before-api-v1-{secrets.token_hex(8)}.db")
-        descriptor = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(descriptor)
-        # Use a separate read connection: backing up the connection holding the
-        # migration's write reservation would wait for its own transaction.
-        with closing(sqlite3.connect(db_path)) as source, closing(sqlite3.connect(backup_path)) as backup:
-            source.backup(backup)
-    db.execute("""
-        CREATE TABLE notes_api_v1 (
-            id INTEGER PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
-            content TEXT NOT NULL CHECK (length(content) BETWEEN 0 AND 10000),
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL
-        )
-    """)
-    db.execute("INSERT INTO notes_api_v1 SELECT id, user_id, title, content, created_at, updated_at FROM notes")
-    db.execute("DROP TABLE notes")
-    db.execute("ALTER TABLE notes_api_v1 RENAME TO notes")
-    db.execute("CREATE INDEX notes_owner_updated ON notes(user_id, updated_at DESC, id DESC)")
-    db.execute("PRAGMA user_version = 1")
+    backup_path = db_path.with_name(f"{db_path.name}.{label}-{secrets.token_hex(8)}.db")
+    descriptor = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(descriptor)
+    # Use a separate read connection: backing up the connection holding the
+    # migration's write reservation would wait for its own transaction.
+    with closing(sqlite3.connect(db_path)) as source, closing(sqlite3.connect(backup_path)) as backup:
+        source.backup(backup)
+
+
+def migrate_database(db, db_path):
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    starting_version = version
+    if version > 2:
+        raise RuntimeError("The database schema is newer than this application supports.")
+    if version == 0:
+        backup_database(db, db_path, "before-api-v1")
+        db.execute("""
+            CREATE TABLE notes_api_v1 (
+                id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL CHECK (length(title) BETWEEN 1 AND 120),
+                content TEXT NOT NULL CHECK (length(content) BETWEEN 0 AND 10000),
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        """)
+        db.execute("INSERT INTO notes_api_v1 SELECT id, user_id, title, content, created_at, updated_at FROM notes")
+        db.execute("DROP TABLE notes")
+        db.execute("ALTER TABLE notes_api_v1 RENAME TO notes")
+        db.execute("CREATE INDEX notes_owner_updated ON notes(user_id, updated_at DESC, id DESC)")
+        db.execute("PRAGMA user_version = 1")
+        version = 1
+    if version == 1:
+        if starting_version == 1:
+            backup_database(db, db_path, "before-audit-v2")
+        db.execute("""
+            CREATE TABLE audit_events (
+                id INTEGER PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK (length(event_type) BETWEEN 1 AND 50),
+                outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied', 'rate_limited')),
+                actor_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                actor_username TEXT CHECK (actor_username IS NULL OR length(actor_username) <= 30),
+                attempted_username TEXT CHECK (attempted_username IS NULL OR length(attempted_username) <= 30),
+                target_type TEXT CHECK (target_type IS NULL OR length(target_type) <= 30),
+                target_id INTEGER,
+                target_label TEXT CHECK (target_label IS NULL OR length(target_label) <= 120),
+                source_ip TEXT NOT NULL CHECK (length(source_ip) BETWEEN 1 AND 45),
+                user_agent TEXT NOT NULL CHECK (length(user_agent) <= 300),
+                channel TEXT NOT NULL CHECK (channel IN ('web', 'api')),
+                reason_code TEXT CHECK (reason_code IS NULL OR length(reason_code) <= 40),
+                request_id TEXT NOT NULL CHECK (length(request_id) = 32)
+            )
+        """)
+        db.execute("CREATE INDEX audit_events_created ON audit_events(created_at DESC, id DESC)")
+        db.execute("CREATE INDEX audit_events_type_created ON audit_events(event_type, created_at DESC)")
+        db.execute("CREATE INDEX audit_events_outcome_created ON audit_events(outcome, created_at DESC)")
+        db.execute("CREATE INDEX audit_events_actor_created ON audit_events(actor_user_id, created_at DESC)")
+        db.execute("CREATE INDEX audit_events_actor_name_created ON audit_events(actor_username, created_at DESC)")
+        db.execute("CREATE INDEX audit_events_attempted_name_created ON audit_events(attempted_username, created_at DESC)")
+        db.execute("CREATE INDEX audit_events_ip_created ON audit_events(source_ip, created_at DESC)")
+        db.execute("PRAGMA user_version = 2")
 
 
 def init_db():
@@ -456,6 +629,8 @@ def init_db():
     db_path.chmod(0o600)
     with app.app_context():
         db = get_db()
+        if db.execute("PRAGMA user_version").fetchone()[0] > 2:
+            raise RuntimeError("The database schema is newer than this application supports.")
         db.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
@@ -488,7 +663,7 @@ def init_db():
         with db:
             # Serialize schema migration and bootstrap across application workers.
             db.execute("BEGIN IMMEDIATE")
-            migrate_notes(db, db_path)
+            migrate_database(db, db_path)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
             if "is_admin" not in columns:
                 db.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1))")
@@ -518,7 +693,110 @@ def token_digest(token):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def enforce_auth_limit(*, account_id=None):
+AUDIT_EVENT_LABELS = {
+    "auth.login": "로그인",
+    "auth.logout": "로그아웃",
+    "account.register": "회원가입",
+    "account.password_change": "비밀번호 변경",
+    "admin.member_password_change": "회원 비밀번호 변경",
+    "authorization.admin_denied": "관리자 접근 거부",
+    "note.create": "메모 생성",
+    "note.update": "메모 수정",
+    "note.delete": "메모 삭제",
+}
+AUDIT_OUTCOME_LABELS = {
+    "success": "성공", "failure": "실패", "denied": "거부", "rate_limited": "제한",
+}
+
+
+def maybe_cleanup_audit_events(db, now):
+    global audit_cleanup_deadline
+    monotonic_now = time.monotonic()
+    if monotonic_now < audit_cleanup_deadline:
+        return
+    with audit_cleanup_lock:
+        if monotonic_now < audit_cleanup_deadline:
+            return
+        cutoff = now - app.config["AUDIT_RETENTION_DAYS"] * 86400
+        db.execute(
+            "DELETE FROM audit_events WHERE id IN "
+            "(SELECT id FROM audit_events WHERE created_at < ? ORDER BY created_at LIMIT 1000)",
+            (cutoff,),
+        )
+        audit_cleanup_deadline = monotonic_now + 3600
+
+
+def clean_audit_text(value, limit):
+    if not value:
+        return None
+    cleaned = "".join("�" if unicodedata.category(char).startswith("C") else char for char in str(value))
+    return cleaned[:limit]
+
+
+def insert_audit_event(
+    db, event_type, outcome, *, actor_user_id=None, actor_username=None,
+    attempted_username=None, target_type=None, target_id=None, target_label=None,
+    reason_code=None, channel=None,
+):
+    if event_type not in AUDIT_EVENT_TYPES or outcome not in AUDIT_OUTCOMES:
+        raise ValueError("Unknown audit event.")
+    if reason_code not in AUDIT_REASON_CODES:
+        raise ValueError("Unknown audit reason.")
+    if channel is None:
+        channel = "api" if getattr(g, "is_api", False) else "web"
+    if channel not in AUDIT_CHANNELS:
+        raise ValueError("Unknown audit channel.")
+    actor = getattr(g, "user", None)
+    if actor is not None:
+        actor_user_id = actor_user_id if actor_user_id is not None else actor["id"]
+        actor_username = actor_username if actor_username is not None else actor["username"]
+    request_id = getattr(g, "request_id", "")
+    if REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+        raise RuntimeError("Request ID is unavailable.")
+    now = int(time.time())
+    maybe_cleanup_audit_events(db, now)
+    return db.execute(
+        "INSERT INTO audit_events "
+        "(created_at, event_type, outcome, actor_user_id, actor_username, attempted_username, "
+        "target_type, target_id, target_label, source_ip, user_agent, channel, reason_code, request_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            now, event_type, outcome, actor_user_id,
+            clean_audit_text(actor_username, 30), clean_audit_text(attempted_username, 30),
+            clean_audit_text(target_type, 30), target_id, clean_audit_text(target_label, 120),
+            (request.remote_addr or "unknown")[:45], clean_audit_text(request.user_agent.string, 300) or "",
+            channel, reason_code, request_id,
+        ),
+    ).lastrowid
+
+
+def record_audit_event(event_type, outcome, **context):
+    db = get_db()
+    with db:
+        return insert_audit_event(db, event_type, outcome, **context)
+
+
+def record_admin_denial():
+    db = get_db()
+    now = int(time.time())
+    scope = f"admin-denied:{g.user['id']}:{request.endpoint}:{request.remote_addr or 'unknown'}"
+    key = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    with db:
+        db.execute("DELETE FROM auth_limits WHERE resets_at <= ?", (now,))
+        created = db.execute(
+            "INSERT INTO auth_limits (key, attempts, resets_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (key, now + 300),
+        )
+        if created.rowcount == 1:
+            insert_audit_event(
+                db, "authorization.admin_denied", "denied",
+                target_type="endpoint", target_label=request.endpoint,
+                reason_code="admin_required",
+            )
+
+
+def enforce_auth_limit(*, account_id=None, audit_context=None):
     limit, window = AUTH_LIMITS[request.endpoint]
     # Use the actual peer address. Forwarded headers are not trusted by default.
     source = f"{request.endpoint}:{request.remote_addr or 'unknown'}"
@@ -535,9 +813,22 @@ def enforce_auth_limit(*, account_id=None):
         db.execute(
             "INSERT INTO auth_limits (key, attempts, resets_at) VALUES (?, 1, ?) "
             "ON CONFLICT(key) DO UPDATE SET attempts = MIN(auth_limits.attempts + 1, ?)",
-            (key, now + window, limit + 1),
+            (key, now + window, limit + 2),
         )
         entry = db.execute("SELECT attempts, resets_at FROM auth_limits WHERE key = ?", (key,)).fetchone()
+        if entry["attempts"] == limit + 1:
+            event_type = {
+                "login": "auth.login", "register": "account.register",
+                "change_password": "account.password_change",
+                "admin_change_password": "admin.member_password_change",
+                "api_create_note": "note.create",
+            }[request.endpoint]
+            insert_audit_event(
+                db, event_type, "rate_limited",
+                attempted_username=request.form.get("username") if request.endpoint in {"login", "register"} else None,
+                reason_code="rate_limit",
+                **(audit_context or {}),
+            )
     if entry["attempts"] > limit:
         raise TooManyRequests(retry_after=max(1, entry["resets_at"] - now))
 
@@ -545,6 +836,7 @@ def enforce_auth_limit(*, account_id=None):
 @app.before_request
 def prepare_request():
     g.csp_nonce = secrets.token_urlsafe(24)
+    g.request_id = secrets.token_hex(16)
     g.user = None
     g.is_api = request.path.startswith("/api/")
     if request.routing_exception is not None and (
@@ -608,9 +900,10 @@ def load_current_user():
 def secure_response(response):
     nonce = getattr(g, "csp_nonce", "")
     response.headers["Content-Security-Policy"] = (
-        f"default-src 'none'; style-src 'nonce-{nonce}'; img-src 'self'; "
+        f"default-src 'none'; style-src 'nonce-{nonce}'; script-src 'self'; connect-src 'self'; img-src 'self'; "
         "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     )
+    response.headers["X-Request-ID"] = getattr(g, "request_id", "")
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -699,6 +992,18 @@ def login_required(view):
     return wrapped
 
 
+def admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if g.user is None:
+            return redirect(url_for("login"))
+        if not g.user["is_admin"]:
+            record_admin_denial()
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapped
+
+
 def owned_note(note_id):
     if not 1 <= note_id <= 2**63 - 1:
         abort(404)
@@ -720,6 +1025,132 @@ def pagination(total):
     if number > pages:
         abort(404)
     return number, pages
+
+
+AUDIT_PERIODS = {"24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "all": None}
+AUDIT_CATEGORIES = {
+    "all": (),
+    "auth": ("auth.login", "auth.logout"),
+    "account": ("account.register", "account.password_change"),
+    "note": ("note.create", "note.update", "note.delete"),
+    "admin": ("admin.member_password_change", "authorization.admin_denied"),
+}
+AUDIT_FILTER_LABELS = {
+    "period": {"24h": "최근 24시간", "7d": "최근 7일", "30d": "최근 30일", "all": "전체 보존 기간"},
+    "outcome": {"all": "모든 결과", "success": "성공", "failure": "실패", "denied": "거부·제한"},
+    "category": {"all": "모든 행동", "auth": "로그인·로그아웃", "account": "계정", "note": "메모", "admin": "관리자"},
+}
+AUDIT_REASON_LABELS = {
+    None: "-", "invalid_input": "입력 형식 오류", "invalid_credentials": "인증 정보 불일치",
+    "username_conflict": "아이디 중복", "current_password_mismatch": "현재 비밀번호 불일치",
+    "confirmation_mismatch": "비밀번호 확인 불일치", "password_reused": "기존 비밀번호 재사용",
+    "concurrent_change": "처리 중 계정 정보 변경", "rate_limit": "요청 횟수 제한",
+    "admin_required": "관리자 권한 필요",
+}
+
+
+def read_audit_filters(*, polling=False):
+    allowed = {"period", "outcome", "category", "username", "ip", "after_id" if polling else "page"}
+    if set(request.args) - allowed or any(len(request.args.getlist(key)) != 1 for key in request.args):
+        abort(400)
+    filters = {
+        "period": request.args.get("period", "24h"),
+        "outcome": request.args.get("outcome", "all"),
+        "category": request.args.get("category", "all"),
+        "username": request.args.get("username", "").strip(),
+        "ip": request.args.get("ip", "").strip(),
+    }
+    if filters["period"] not in AUDIT_PERIODS or filters["outcome"] not in AUDIT_FILTER_LABELS["outcome"]:
+        abort(400)
+    if filters["category"] not in AUDIT_CATEGORIES:
+        abort(400)
+    if filters["username"] and (
+        len(filters["username"]) > 30 or any(ord(char) < 32 or ord(char) == 127 for char in filters["username"])
+    ):
+        abort(400)
+    if filters["ip"]:
+        try:
+            filters["ip"] = str(ipaddress.ip_address(filters["ip"]))
+        except ValueError:
+            abort(400)
+    number = None
+    after_id = None
+    if polling:
+        value = request.args.get("after_id", "0")
+        if re.fullmatch(r"0|[1-9][0-9]{0,18}", value) is None or int(value) > 2**63 - 1:
+            abort(400)
+        after_id = int(value)
+    else:
+        value = request.args.get("page", "1")
+        if re.fullmatch(r"[1-9][0-9]{0,8}", value) is None:
+            abort(400)
+        number = int(value)
+    return filters, number, after_id
+
+
+def audit_where(filters, *, after_id=None):
+    clauses, values = [], []
+    seconds = AUDIT_PERIODS[filters["period"]]
+    if seconds is not None:
+        clauses.append("created_at >= ?")
+        values.append(int(time.time()) - seconds)
+    if filters["outcome"] == "success":
+        clauses.append("outcome = 'success'")
+    elif filters["outcome"] == "failure":
+        clauses.append("outcome = 'failure'")
+    elif filters["outcome"] == "denied":
+        clauses.append("outcome IN ('denied', 'rate_limited')")
+    event_types = AUDIT_CATEGORIES[filters["category"]]
+    if event_types:
+        clauses.append(f"event_type IN ({','.join('?' for _ in event_types)})")
+        values.extend(event_types)
+    if filters["username"]:
+        clauses.append("(actor_username = ? OR attempted_username = ?)")
+        values.extend((filters["username"], filters["username"]))
+    if filters["ip"]:
+        clauses.append("source_ip = ?")
+        values.append(filters["ip"])
+    if after_id is not None:
+        clauses.append("id > ?")
+        values.append(after_id)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", values
+
+
+def audit_summary(db):
+    since = int(time.time()) - 86400
+    row = db.execute(
+        "SELECT "
+        "SUM(event_type = 'auth.login' AND outcome = 'success') AS login_success, "
+        "SUM(event_type = 'auth.login' AND outcome IN ('failure', 'rate_limited')) AS login_failure, "
+        "COUNT(DISTINCT CASE WHEN outcome = 'success' THEN actor_user_id END) AS active_users, "
+        "SUM(outcome = 'denied') AS denied "
+        "FROM audit_events WHERE created_at >= ?",
+        (since,),
+    ).fetchone()
+    return {key: int(row[key] or 0) for key in ("login_success", "login_failure", "active_users", "denied")}
+
+
+def audit_event_json(event):
+    actor = event["actor_username"] or event["attempted_username"] or "알 수 없음"
+    target = event["target_label"]
+    if target is None and event["target_type"] and event["target_id"] is not None:
+        target = f"{event['target_type']} #{event['target_id']}"
+    return {
+        "id": event["id"],
+        "created_at": datetime.fromtimestamp(event["created_at"], NOTE_TIMEZONE).isoformat(),
+        "display_time": display_time(event["created_at"]),
+        "event_type": event["event_type"],
+        "event_label": AUDIT_EVENT_LABELS[event["event_type"]],
+        "outcome": event["outcome"],
+        "outcome_label": AUDIT_OUTCOME_LABELS[event["outcome"]],
+        "actor": actor,
+        "target": target or "-",
+        "source_ip": event["source_ip"],
+        "user_agent": event["user_agent"] or "-",
+        "channel": "API" if event["channel"] == "api" else "웹",
+        "reason": AUDIT_REASON_LABELS[event["reason_code"]],
+        "request_id": event["request_id"],
+    }
 
 
 def validate_note(title, content):
@@ -793,6 +1224,9 @@ def api_create_note():
             "INSERT INTO notes (user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
             (g.user["id"], title, content, now, now),
         ).lastrowid
+        insert_audit_event(
+            db, "note.create", "success", target_type="note", target_id=note_id, channel="api",
+        )
     response = jsonify(note_json(owned_note(note_id)))
     response.status_code = 201
     response.headers["Location"] = url_for("api_view_note", note_id=note_id)
@@ -819,20 +1253,36 @@ def register():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         if username.casefold() == "admin":
+            record_audit_event("account.register", "failure", attempted_username=username, reason_code="invalid_input")
             return page("register", "회원가입", error="사용할 수 없는 아이디입니다.", status=400)
         if not 3 <= len(username) <= 30 or not all(char.isalnum() or char in "_.-" for char in username):
+            record_audit_event("account.register", "failure", attempted_username=username, reason_code="invalid_input")
             return page("register", "회원가입", error="아이디는 3~30자의 글자, 숫자, 밑줄, 점, 하이픈으로 입력하세요.", status=400)
         if not PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH:
+            record_audit_event("account.register", "failure", attempted_username=username, reason_code="invalid_input")
             return page("register", "회원가입", error=f"비밀번호는 {PASSWORD_MIN_LENGTH}~{PASSWORD_MAX_LENGTH}자로 입력하세요.", status=400)
         db = get_db()
-        try:
-            db.execute(
-                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
+        conflict = False
+        with db:
+            result = db.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0) "
+                "ON CONFLICT(username) DO NOTHING",
                 (username, generate_password_hash(password)),
             )
-            db.commit()
-        except sqlite3.IntegrityError:
-            db.rollback()
+            if result.rowcount != 1:
+                conflict = True
+            else:
+                user_id = result.lastrowid
+                insert_audit_event(
+                    db, "account.register", "success", actor_user_id=user_id,
+                    actor_username=username, attempted_username=username,
+                    target_type="user", target_id=user_id, target_label=username,
+                )
+        if conflict:
+            record_audit_event(
+                "account.register", "failure", attempted_username=username,
+                target_type="user", target_label=username, reason_code="username_conflict",
+            )
             return page("register", "회원가입", error="이미 사용 중인 아이디입니다.", status=409)
         return redirect(url_for("login", registered=1))
     return page("register", "회원가입")
@@ -847,12 +1297,14 @@ def login():
         password = request.form.get("password", "")
         invalid_login = "아이디 또는 비밀번호가 올바르지 않습니다."
         if not 3 <= len(username) <= 30 or not 1 <= len(password) <= PASSWORD_MAX_LENGTH:
+            record_audit_event("auth.login", "failure", attempted_username=username, reason_code="invalid_credentials")
             return page("login", "로그인", error=invalid_login, status=401)
         user = get_db().execute(
-            "SELECT id, password_hash FROM users WHERE username = ?", (username,)
+            "SELECT id, username, password_hash FROM users WHERE username = ?", (username,)
         ).fetchone()
         password_matches = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH, password)
         if user is None or not password_matches:
+            record_audit_event("auth.login", "failure", attempted_username=username, reason_code="invalid_credentials")
             return page("login", "로그인", error=invalid_login, status=401)
         token = secrets.token_hex(32)
         now = int(time.time())
@@ -867,7 +1319,16 @@ def login():
                 (token_digest(token), expires_at, user["id"], user["password_hash"]),
             )
             if result.rowcount != 1:
+                insert_audit_event(
+                    db, "auth.login", "failure", attempted_username=username,
+                    reason_code="concurrent_change",
+                )
                 return page("login", "로그인", error=invalid_login, status=401)
+            insert_audit_event(
+                db, "auth.login", "success", actor_user_id=user["id"],
+                actor_username=user["username"], attempted_username=username,
+                target_type="user", target_id=user["id"], target_label=user["username"],
+            )
         session.clear()
         session["auth_token"] = token
         session.permanent = True
@@ -889,29 +1350,39 @@ def logout():
         db = get_db()
         with db:
             db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_digest(token),))
+            if g.user is not None:
+                insert_audit_event(
+                    db, "auth.logout", "success",
+                    target_type="user", target_id=g.user["id"], target_label=g.user["username"],
+                )
     session.clear()
     return redirect(url_for("login", logged_out=1))
 
 
 def password_change_form(member, *, admin_action=False):
-    error, status = None, 200
+    error, status, reason_code = None, 200, None
+    event_type = "admin.member_password_change" if admin_action else "account.password_change"
+    audit_target = {
+        "target_type": "user", "target_id": member["id"], "target_label": member["username"],
+    }
     if request.method == "POST":
-        enforce_auth_limit(account_id=g.user["id"])
+        enforce_auth_limit(account_id=g.user["id"], audit_context=audit_target)
         current = request.form["current_password"]
         new = request.form["new_password"]
         confirmation = request.form["confirm_password"]
         db = get_db()
         actor = db.execute("SELECT password_hash FROM users WHERE id = ?", (g.user["id"],)).fetchone()
         if not PASSWORD_MIN_LENGTH <= len(new) <= PASSWORD_MAX_LENGTH:
-            error, status = f"새 비밀번호는 {PASSWORD_MIN_LENGTH}~{PASSWORD_MAX_LENGTH}자로 입력하세요.", 400
+            error, status, reason_code = f"새 비밀번호는 {PASSWORD_MIN_LENGTH}~{PASSWORD_MAX_LENGTH}자로 입력하세요.", 400, "invalid_input"
         elif new != confirmation:
-            error, status = "새 비밀번호와 확인 입력이 일치하지 않습니다.", 400
+            error, status, reason_code = "새 비밀번호와 확인 입력이 일치하지 않습니다.", 400, "confirmation_mismatch"
         elif not 1 <= len(current) <= PASSWORD_MAX_LENGTH or actor is None or not check_password_hash(actor["password_hash"], current):
-            error, status = "현재 비밀번호가 올바르지 않습니다.", 401
+            error, status, reason_code = "현재 비밀번호가 올바르지 않습니다.", 401, "current_password_mismatch"
         elif check_password_hash(member["password_hash"], new):
-            error, status = "기존 비밀번호와 다른 새 비밀번호를 입력하세요.", 400
+            error, status, reason_code = "기존 비밀번호와 다른 새 비밀번호를 입력하세요.", 400, "password_reused"
         else:
             new_hash = generate_password_hash(new)
+            authorization_failed = False
             with db:
                 db.execute("BEGIN IMMEDIATE")
                 # Recheck authority inside the write transaction, including revocation
@@ -925,19 +1396,25 @@ def password_change_form(member, *, admin_action=False):
                      int(time.time()), int(admin_action)),
                 ).fetchone()
                 if authorized is None:
-                    abort(403)
-                result = db.execute(
-                    "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
-                    (new_hash, member["id"], member["password_hash"]),
-                )
-                if result.rowcount != 1:
-                    abort(409)
-                db.execute("DELETE FROM auth_sessions WHERE user_id = ?", (member["id"],))
+                    authorization_failed = True
+                else:
+                    result = db.execute(
+                        "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+                        (new_hash, member["id"], member["password_hash"]),
+                    )
+                    if result.rowcount != 1:
+                        abort(409)
+                    db.execute("DELETE FROM auth_sessions WHERE user_id = ?", (member["id"],))
+                    insert_audit_event(db, event_type, "success", **audit_target)
+            if authorization_failed:
+                record_audit_event(event_type, "denied", reason_code="concurrent_change", **audit_target)
+                abort(403)
             if member["id"] == g.user["id"]:
                 session.clear()
                 return redirect(url_for("login", password_changed=1))
             session["csrf_token"] = secrets.token_hex(32)
             return redirect(url_for("admin_users", password_changed=1))
+        record_audit_event(event_type, "failure", reason_code=reason_code, **audit_target)
     return page(
         "password_change", "회원 비밀번호 변경" if admin_action else "비밀번호 변경",
         member=member, admin_action=admin_action, error=error, status=status,
@@ -956,10 +1433,8 @@ def change_password():
 
 
 @app.route("/admin/users/<int:user_id>/password", methods=["GET", "POST"])
-@login_required
+@admin_required
 def admin_change_password(user_id):
-    if not g.user["is_admin"]:
-        abort(403)
     if not 1 <= user_id <= 2**63 - 1:
         abort(404)
     member = get_db().execute(
@@ -1001,6 +1476,7 @@ def create_note():
                     "INSERT INTO notes (user_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                     (g.user["id"], title, content, now, now),
                 ).lastrowid
+                insert_audit_event(db, "note.create", "success", target_type="note", target_id=note_id)
             return redirect(url_for("view_note", note_id=note_id, saved=1))
     return page(
         "note_form", "새 메모", form_title=title, form_content=content,
@@ -1033,6 +1509,7 @@ def edit_note(note_id):
                 )
                 if result.rowcount != 1:
                     abort(404)
+                insert_audit_event(db, "note.update", "success", target_type="note", target_id=note_id)
             return redirect(url_for("view_note", note_id=note_id, saved=1))
     return page(
         "note_form", "메모 수정", form_title=title, form_content=content,
@@ -1050,15 +1527,14 @@ def delete_note(note_id):
             result = db.execute("DELETE FROM notes WHERE id = ? AND user_id = ?", (note_id, g.user["id"]))
             if result.rowcount != 1:
                 abort(404)
+            insert_audit_event(db, "note.delete", "success", target_type="note", target_id=note_id)
         return redirect(url_for("list_notes", deleted=1))
     return page("note_delete", "메모 삭제", note=note)
 
 
 @app.get("/admin")
-@login_required
+@admin_required
 def admin_users():
-    if not g.user["is_admin"]:
-        abort(403)
     db = get_db()
     total = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     number, pages = pagination(total)
@@ -1069,6 +1545,58 @@ def admin_users():
     return page(
         "admin", "회원 관리", members=members, total=total, number=number, pages=pages,
         notice="회원 비밀번호를 변경하고 해당 회원의 모든 로그인을 종료했습니다." if request.args.get("password_changed") == "1" else None,
+    )
+
+
+AUDIT_SELECT = (
+    "SELECT id, created_at, event_type, outcome, actor_username, attempted_username, "
+    "target_type, target_id, target_label, source_ip, user_agent, channel, reason_code, request_id "
+    "FROM audit_events"
+)
+
+
+@app.get("/admin/audit")
+@admin_required
+def admin_audit():
+    filters, number, _ = read_audit_filters()
+    where, values = audit_where(filters)
+    db = get_db()
+    latest_id = db.execute("SELECT COALESCE(MAX(id), 0) FROM audit_events").fetchone()[0]
+    snapshot_where = where + (" AND id <= ?" if where else " WHERE id <= ?")
+    snapshot_values = (*values, latest_id)
+    total = db.execute("SELECT COUNT(*) FROM audit_events" + snapshot_where, snapshot_values).fetchone()[0]
+    pages = max(1, (total + AUDIT_PAGE_SIZE - 1) // AUDIT_PAGE_SIZE)
+    if number > pages:
+        abort(404)
+    rows = db.execute(
+        AUDIT_SELECT + snapshot_where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (*snapshot_values, AUDIT_PAGE_SIZE, (number - 1) * AUDIT_PAGE_SIZE),
+    ).fetchall()
+    events = [audit_event_json(row) for row in rows]
+    query = {key: value for key, value in filters.items() if value}
+    previous_url = url_for("admin_audit", page=number - 1, **query) if number > 1 else None
+    next_url = url_for("admin_audit", page=number + 1, **query) if number < pages else None
+    poll_url = url_for("api_admin_audit_events", **query) if number == 1 else None
+    return page(
+        "audit", "활동 기록", events=events, total=total, summary=audit_summary(db),
+        filters=filters, filter_labels=AUDIT_FILTER_LABELS, number=number, pages=pages,
+        previous_url=previous_url, next_url=next_url, poll_url=poll_url, latest_id=latest_id,
+        retention_days=app.config["AUDIT_RETENTION_DAYS"],
+    )
+
+
+@app.get("/api/admin/audit/events")
+@admin_required
+def api_admin_audit_events():
+    filters, _, after_id = read_audit_filters(polling=True)
+    where, values = audit_where(filters, after_id=after_id)
+    db = get_db()
+    rows = db.execute(AUDIT_SELECT + where + " ORDER BY id ASC LIMIT 101", values).fetchall()
+    has_more = len(rows) > 100
+    return jsonify(
+        events=[audit_event_json(row) for row in rows[:100]],
+        has_more=has_more,
+        summary=audit_summary(db),
     )
 
 

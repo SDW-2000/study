@@ -59,7 +59,7 @@ class IsolatedApp(unittest.TestCase):
 class NotesApiTests(IsolatedApp):
     def setUp(self):
         with closing(sqlite3.connect(self.database)) as db, db:
-            for table in ("auth_sessions", "auth_limits", "notes", "users"):
+            for table in ("audit_events", "auth_sessions", "auth_limits", "notes", "users"):
                 db.execute(f"DELETE FROM {table}")
             db.executemany(
                 "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)",
@@ -265,6 +265,145 @@ class NotesApiTests(IsolatedApp):
         self.assertIn('href="/static/favicon.ico"', response.text)
 
 
+class AuditLogTests(IsolatedApp):
+    def setUp(self):
+        self.module.audit_cleanup_deadline = 0.0
+        with closing(sqlite3.connect(self.database)) as db, db:
+            for table in ("audit_events", "auth_sessions", "auth_limits", "notes", "users"):
+                db.execute(f"DELETE FROM {table}")
+            db.executemany(
+                "INSERT INTO users (id, username, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+                [(1, "admin", self.password_hash, 1), (2, "alice", self.password_hash, 0),
+                 (3, "bob", self.password_hash, 0)],
+            )
+
+    def clear_audit(self):
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute("DELETE FROM audit_events")
+            db.execute("DELETE FROM auth_limits")
+
+    def audit_rows(self, where="1=1", params=()):
+        with closing(sqlite3.connect(self.database)) as db:
+            db.row_factory = sqlite3.Row
+            return db.execute(f"SELECT * FROM audit_events WHERE {where} ORDER BY id", params).fetchall()
+
+    def test_login_events_are_structured_and_do_not_store_secrets(self):
+        client = self.app.test_client()
+        token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/login").text).group(1)
+        failed = client.post("/login", data={"username": "nobody", "password": "unique-secret-canary", "csrf_token": token},
+                             environ_overrides={"REMOTE_ADDR": "203.0.113.9"}, headers={"User-Agent": "Audit <script>"})
+        self.assertEqual(failed.status_code, 401)
+        success = client.post("/login", data={"username": "alice", "password": PASSWORD, "csrf_token": token},
+                              environ_overrides={"REMOTE_ADDR": "203.0.113.10"})
+        self.assertEqual(success.status_code, 302)
+        rows = self.audit_rows("event_type = 'auth.login'")
+        self.assertEqual([row["outcome"] for row in rows], ["failure", "success"])
+        self.assertIsNone(rows[0]["actor_user_id"])
+        self.assertEqual(rows[0]["attempted_username"], "nobody")
+        self.assertEqual(rows[0]["reason_code"], "invalid_credentials")
+        self.assertEqual(rows[0]["source_ip"], "203.0.113.9")
+        self.assertEqual(rows[1]["actor_user_id"], 2)
+        self.assertEqual(rows[1]["request_id"], success.headers["X-Request-ID"])
+        stored = " ".join(str(value) for row in rows for value in row if value is not None)
+        self.assertNotIn("unique-secret-canary", stored)
+        self.assertNotIn(token, stored)
+
+    def test_note_changes_and_logout_are_recorded_without_note_content(self):
+        client, _ = self.sign_in("alice")
+        self.clear_audit()
+        csrf = client.get("/api/csrf").json["csrf_token"]
+        created = client.post("/api/notes", json={"title": "private title", "body": "private body"},
+                              headers={"X-CSRF-Token": csrf})
+        note_id = created.json["id"]
+        edited = client.post(f"/notes/{note_id}/edit", data={
+            "csrf_token": csrf, "title": "changed title", "content": "changed body",
+        })
+        self.assertEqual(edited.status_code, 302)
+        deleted = client.post(f"/notes/{note_id}/delete", data={"csrf_token": csrf})
+        self.assertEqual(deleted.status_code, 302)
+        self.assertEqual(client.post("/logout", data={"csrf_token": csrf}).status_code, 302)
+        rows = self.audit_rows()
+        self.assertEqual([row["event_type"] for row in rows],
+                         ["note.create", "note.update", "note.delete", "auth.logout"])
+        self.assertEqual(rows[0]["channel"], "api")
+        self.assertTrue(all(row["actor_username"] == "alice" for row in rows))
+        stored = " ".join(str(value) for row in rows for value in row if value is not None)
+        for secret in ("private title", "private body", "changed title", "changed body"):
+            self.assertNotIn(secret, stored)
+
+    def test_admin_page_and_polling_are_admin_only(self):
+        anonymous = self.app.test_client()
+        self.assertEqual(anonymous.get("/admin/audit").status_code, 302)
+        self.assert_error(anonymous.get("/api/admin/audit/events"), 401)
+
+        member, _ = self.sign_in("alice")
+        self.clear_audit()
+        self.assertEqual(member.get("/admin/audit").status_code, 403)
+        denied = member.get("/api/admin/audit/events")
+        self.assert_error(denied, 403)
+        self.assertEqual(len(self.audit_rows("event_type = 'authorization.admin_denied'")), 2)
+
+        admin, _ = self.sign_in("admin")
+        page = admin.get("/admin/audit")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("활동 기록", page.text)
+        self.assertIn("/static/admin_audit.js", page.text)
+        self.assertIn("script-src 'self'", page.headers["Content-Security-Policy"])
+        polling = admin.get("/api/admin/audit/events?after_id=0")
+        self.assertEqual(polling.status_code, 200)
+        self.assertEqual(polling.mimetype, "application/json")
+        self.assertIn("events", polling.json)
+        self.assertIn("summary", polling.json)
+
+    def test_polling_filters_and_validation(self):
+        admin, _ = self.sign_in("admin")
+        self.clear_audit()
+        client = self.app.test_client()
+        token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/login").text).group(1)
+        client.post("/login", data={"username": "nobody", "password": "wrong", "csrf_token": token},
+                    environ_overrides={"REMOTE_ADDR": "192.0.2.10"})
+        response = admin.get("/api/admin/audit/events?after_id=0&outcome=failure&category=auth&ip=192.0.2.10")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json["events"]), 1)
+        self.assertEqual(response.json["events"][0]["actor"], "nobody")
+        for path in (
+            "/api/admin/audit/events?after_id=-1",
+            "/api/admin/audit/events?after_id=0&after_id=1",
+            "/api/admin/audit/events?after_id=0&outcome=unknown",
+            "/api/admin/audit/events?after_id=0&ip=not-an-ip",
+        ):
+            self.assert_error(admin.get(path), 400)
+
+    def test_login_rate_limit_creates_one_bounded_event(self):
+        client = self.app.test_client()
+        token = re.search(r'name="csrf_token" value="([^"]+)"', client.get("/login").text).group(1)
+        for _ in range(12):
+            response = client.post("/login", data={"username": "alice", "password": "wrong", "csrf_token": token},
+                                   environ_overrides={"REMOTE_ADDR": "198.51.100.7"})
+        self.assertEqual(response.status_code, 429)
+        rows = self.audit_rows("event_type = 'auth.login'")
+        self.assertEqual(sum(row["outcome"] == "failure" for row in rows), 10)
+        self.assertEqual(sum(row["outcome"] == "rate_limited" for row in rows), 1)
+
+    def test_audit_insert_failure_rolls_back_note_creation(self):
+        client, _ = self.sign_in("alice")
+        self.clear_audit()
+        csrf = client.get("/api/csrf").json["csrf_token"]
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+        try:
+            with patch.dict(self.app.config, TESTING=False), patch.object(self.app.logger, "error"):
+                response = client.post("/api/notes", json={"title": "must rollback"},
+                                       headers={"X-CSRF-Token": csrf})
+            self.assertEqual(response.status_code, 500)
+            with closing(sqlite3.connect(self.database)) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM notes").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0], 0)
+        finally:
+            with closing(sqlite3.connect(self.database)) as db, db:
+                db.execute("DROP TRIGGER reject_audit")
+
+
 class NotesMigrationTests(IsolatedApp):
     def setUp(self):
         self.legacy_dir = tempfile.TemporaryDirectory()
@@ -298,7 +437,8 @@ class NotesMigrationTests(IsolatedApp):
             self.assertEqual(db.execute("SELECT * FROM notes").fetchall(), backup.execute("SELECT * FROM notes").fetchall())
             self.assertEqual(db.execute("SELECT * FROM users").fetchall(), backup.execute("SELECT * FROM users").fetchall())
             self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 0)
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertIsNotNone(db.execute("SELECT name FROM sqlite_master WHERE name = 'audit_events'").fetchone())
             self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertIn("notes_owner_updated", [row[1] for row in db.execute("PRAGMA index_list(notes)")])
             with db:
@@ -337,12 +477,12 @@ class NotesMigrationTests(IsolatedApp):
 
     def test_future_schema_version_is_not_downgraded(self):
         with closing(sqlite3.connect(self.legacy)) as db, db:
-            db.execute("PRAGMA user_version = 2")
+            db.execute("PRAGMA user_version = 3")
         result = subprocess.run([sys.executable, "-c", "import app"], cwd=APP_PATH.parent,
                                 env=self.environment_for_migration, capture_output=True, timeout=20)
         self.assertNotEqual(result.returncode, 0)
         with closing(sqlite3.connect(self.legacy)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(db.execute("SELECT id FROM notes").fetchall(), [(42,)])
 
 

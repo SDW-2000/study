@@ -59,7 +59,7 @@ POST_FIELDS = {
 }
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_hex(32))
 
-app = Flask(__name__, static_folder=None)
+app = Flask(__name__, static_folder="static")
 app.config.update(
     SECRET_KEY=secret_key or secrets.token_hex(32),
     DATABASE=os.environ.get("DATABASE_PATH") or str(Path(__file__).with_name("users.db")),
@@ -88,6 +88,7 @@ PAGE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }} · 메모</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon">
   <style nonce="{{ csp_nonce }}">
     :root {
       color-scheme: light;
@@ -533,7 +534,7 @@ def prepare_request():
 def secure_response(response):
     nonce = getattr(g, "csp_nonce", "")
     response.headers["Content-Security-Policy"] = (
-        f"default-src 'none'; style-src 'nonce-{nonce}'; "
+        f"default-src 'none'; style-src 'nonce-{nonce}'; img-src 'self'; "
         "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"

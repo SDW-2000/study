@@ -12,6 +12,7 @@ RUN groupadd --gid 10001 memo \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+COPY static/favicon.ico ./static/favicon.ico
 
 USER 10001:10001
 EXPOSE 8000

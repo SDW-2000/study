@@ -3,3 +3,5 @@
 !Dockerfile
 !requirements.txt
 !app.py
+!static/
+!static/favicon.ico

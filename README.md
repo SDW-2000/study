@@ -32,15 +32,13 @@ python3 docker_setup.py
 
 `SITE_ADDRESS`에는 `https://`, 경로, 포트 없이 서버 IPv4 주소 또는 도메인을 넣습니다. Compose가 이 주소를 Flask의 `TRUSTED_HOSTS`와 Caddy 설정에 동일하게 적용합니다. `.env`는 Git과 이미지 빌드 대상에서 제외되므로 GitHub에서 내려받은 새 서버에서도 이 명령을 실행해야 합니다.
 
-이미 `.env`가 있으면 비밀키와 관리자 비밀번호를 유지합니다. `SITE_ADDRESS=localhost`인 경우 새 주소를 묻고, 주소를 나중에 바꾸려면 `python3 docker_setup.py --site-address testsite.example.com`을 실행합니다. 이 명령은 변경된 설정으로 컨테이너를 다시 생성합니다. `.env`만 준비하려면 `--configure-only`를 사용할 수 있습니다. Docker의 기존 DB에서는 `.env`의 `ADMIN_PASSWORD`를 바꿔도 실제 관리자 계정 비밀번호가 변경되지 않습니다. 로그인 후 앱의 **비밀번호 변경** 화면에서 변경하세요. 로컬 실행용 `.admin-initial-password`와는 별개입니다.
+이미 `.env`가 있으면 비밀키와 관리자 비밀번호를 유지합니다. `SITE_ADDRESS=localhost`인 경우 새 주소를 묻고, 주소를 나중에 바꾸려면 `python3 docker_setup.py --site-address memo.example.com`을 실행합니다. 이 명령은 변경된 설정으로 컨테이너를 다시 생성합니다. `.env`만 준비하려면 `--configure-only`를 사용할 수 있습니다. Docker의 기존 DB에서는 `.env`의 `ADMIN_PASSWORD`를 바꿔도 실제 관리자 계정 비밀번호가 변경되지 않습니다. 로그인 후 앱의 **비밀번호 변경** 화면에서 변경하세요. 로컬 실행용 `.admin-initial-password`와는 별개입니다.
 
 IP 주소로 접속할 때 클라이언트가 TLS SNI를 보내지 않는 경우를 위해 Caddy는 `SITE_ADDRESS`를 기본 SNI로 사용합니다. 클라우드 NAT 뒤에 있는 서버에서는 이 설정이 없으면 인증서를 발급한 뒤에도 TLS 연결이 실패할 수 있습니다.
 
 `BIND_IP`는 기본 `0.0.0.0`으로 둡니다. 클라우드 VM의 공인 IP가 내부 네트워크 인터페이스에 직접 할당되지 않은 경우, 공인 IP를 `BIND_IP`로 넣으면 Caddy의 80·443번 포트 연결이 실패합니다. 확인에는 `docker compose ps`와 `docker compose logs --tail=100 app caddy`를 사용합니다.
 
-브라우저에서 `https://설정한주소`로 접속합니다. 도메인을 사용하는 경우 DNS A/AAAA 레코드가 배포 서버를 가리켜야 하며 서버 방화벽·클라우드 보안 그룹·공유기에서 TCP 80/443 접근을 허용해야 합니다. Google Compute Engine의 기본 HTTP/HTTPS 방화벽 규칙은 `http-server`와 `https-server` 네트워크 태그를 가진 VM에만 적용되므로, 규칙과 VM 태그를 함께 확인하세요. Caddy가 공개 인증서 발급과 갱신, HTTP에서 HTTPS로 전환을 처리합니다. 앱의 8000번 포트를 추가로 공개하지 마세요. [Google Cloud 방화벽 안내](https://docs.cloud.google.com/compute/docs/tutorials/basic-webserver-apache)
-
-Cloudflare에서 구매처가 Spaceship인 도메인을 사용한다면, 먼저 Cloudflare가 지정한 두 네임서버를 Spaceship의 **Advanced DNS → Nameservers → Custom nameservers**에 정확히 입력합니다. 기존 네임서버가 추가로 남아 있거나 DNSSEC의 이전 DS 레코드가 남아 있으면 Cloudflare가 도메인을 Active로 인증하지 못할 수 있습니다. Cloudflare가 Active가 된 뒤 사용할 호스트 이름(`testsite` 등)의 A 레코드를 서버 공인 IP로 지정합니다. 인증서 발급을 확인할 때는 **DNS only**로 두고, Mac에서 `curl -I https://testsite.example.com`이 `-k` 없이 응답하면 **Proxied**로 바꾸고 Cloudflare SSL/TLS를 **Full (strict)**로 설정합니다. 이 과정에서 서버의 `SITE_ADDRESS`도 정확히 같은 도메인으로 변경해야 합니다. [Cloudflare 네임서버 안내](https://developers.cloudflare.com/dns/zone-setups/full-setup/setup/), [Spaceship 설정 안내](https://www.spaceship.com/knowledgebase/connect-domain-custom-nameservers/), [Cloudflare Full (strict)](https://developers.cloudflare.com/ssl/origin-configuration/ssl-modes/full-strict/)
+브라우저에서 `https://설정한주소`로 접속합니다. 도메인을 사용하는 경우 DNS A/AAAA 레코드가 배포 서버를 가리켜야 하며 서버 방화벽·클라우드 보안 그룹·공유기에서 TCP 80/443 접근을 허용해야 합니다. 방화벽 규칙이 실제 배포 서버에 적용되는지도 확인하세요. Caddy가 공개 인증서 발급과 갱신, HTTP에서 HTTPS로 전환을 처리합니다. 앱의 8000번 포트를 추가로 공개하지 마세요.
 
 IP 또는 localhost를 사용하면 Caddy의 내부 CA가 인증서를 발급합니다. 접속하는 각 기기가 이 CA를 신뢰해야 인증서 오류 없이 사용할 수 있습니다. 아래 명령으로 **공개 루트 인증서만** 추출할 수 있습니다. 추출 파일의 출처와 지문을 확인한 후 해당 기기의 신뢰 저장소에 등록하세요. 루트 인증서의 자동 설치는 수행하지 않습니다.
 

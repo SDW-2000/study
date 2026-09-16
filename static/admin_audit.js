@@ -30,9 +30,12 @@
     list.append(description);
   }
 
-  function eventRow(event) {
+  function eventRows(event) {
+    const fragment = document.createDocumentFragment();
     const row = document.createElement("tr");
+    row.className = "audit-event-row";
     row.dataset.eventId = String(event.id);
+    row.dataset.detailId = `audit-detail-${event.id}`;
 
     const timeCell = document.createElement("td");
     const time = textElement("time", "audit-time", event.display_time);
@@ -52,21 +55,32 @@
     ipCell.translate = false;
 
     const detailCell = document.createElement("td");
-    const details = document.createElement("details");
-    details.className = "audit-detail";
-    details.append(textElement("summary", "", "보기"));
+    const toggle = textElement("button", "audit-detail-toggle", "보기");
+    toggle.type = "button";
+    toggle.setAttribute("aria-expanded", "false");
+    toggle.setAttribute("aria-controls", row.dataset.detailId);
+    detailCell.append(toggle);
+
+    const detailRow = document.createElement("tr");
+    detailRow.id = row.dataset.detailId;
+    detailRow.className = "audit-detail-row";
+    detailRow.hidden = true;
+    const detailContent = document.createElement("td");
+    detailContent.colSpan = 6;
     const list = document.createElement("dl");
+    list.className = "audit-detail-list";
     detailPair(list, "대상", event.target);
     detailPair(list, "경로", event.channel);
     detailPair(list, "사유", event.reason);
     detailPair(list, "IP", event.source_ip, { machine: true });
     detailPair(list, "User-Agent", event.user_agent);
     detailPair(list, "요청 ID", event.request_id, { machine: true });
-    details.append(list);
-    detailCell.append(details);
+    detailContent.append(list);
+    detailRow.append(detailContent);
 
     row.append(timeCell, outcomeCell, actionCell, actorCell, ipCell, detailCell);
-    return row;
+    fragment.append(row, detailRow);
+    return fragment;
   }
 
   function updateSummary(summary) {
@@ -89,8 +103,11 @@
   }
 
   function trimRows() {
-    const rows = feed.querySelectorAll("tr[data-event-id]");
-    for (let index = 200; index < rows.length; index += 1) rows[index].remove();
+    const rows = feed.querySelectorAll(".audit-event-row[data-event-id]");
+    for (let index = 200; index < rows.length; index += 1) {
+      document.getElementById(rows[index].dataset.detailId)?.remove();
+      rows[index].remove();
+    }
   }
 
   async function poll() {
@@ -110,7 +127,7 @@
       const empty = document.querySelector("#audit-empty");
       if (data.events.length && empty) empty.remove();
       for (const event of data.events) {
-        feed.insertBefore(eventRow(event), feed.firstChild);
+        feed.insertBefore(eventRows(event), feed.firstChild);
         latestId = Math.max(latestId, event.id);
       }
       if (total && data.events.length) {
@@ -133,6 +150,17 @@
   refreshButton.addEventListener("click", () => {
     if (pollUrl) poll();
     else window.location.reload();
+  });
+
+  feed.addEventListener("click", (clickEvent) => {
+    const toggle = clickEvent.target.closest(".audit-detail-toggle");
+    if (!toggle || !feed.contains(toggle)) return;
+    const detailRow = document.getElementById(toggle.getAttribute("aria-controls"));
+    if (!detailRow) return;
+    const willOpen = toggle.getAttribute("aria-expanded") !== "true";
+    toggle.setAttribute("aria-expanded", String(willOpen));
+    toggle.textContent = willOpen ? "닫기" : "보기";
+    detailRow.hidden = !willOpen;
   });
 
   if (pauseButton) {

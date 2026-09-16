@@ -238,16 +238,19 @@ PAGE = """<!doctype html>
     .audit-badge.success { color: #18732d; background: #eaf7ed; }
     .audit-badge.failure { color: #a1261c; background: #fff0ef; }
     .audit-badge.denied, .audit-badge.rate_limited { color: #805900; background: #fff7df; }
-    .audit-detail summary { display: inline-flex; min-height: 2.75rem; align-items: center; color: var(--accent); font-weight: 650; cursor: pointer; touch-action: manipulation; }
-    .audit-detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .4rem .7rem; min-width: 16rem; margin: .25rem 0 .75rem; padding: .8rem; border-radius: .75rem; background: var(--background); font-size: .78rem; }
-    .audit-detail dt { color: var(--muted); font-weight: 650; }
-    .audit-detail dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+    .audit-detail-toggle { display: inline-flex; min-height: 2.75rem; align-items: center; padding: 0; border: 0; background: transparent; color: var(--accent); font: inherit; font-weight: 650; cursor: pointer; touch-action: manipulation; }
+    .audit-detail-toggle:hover { text-decoration: underline; }
+    .audit-detail-row[hidden] { display: none; }
+    .audit-detail-row > td { padding: .25rem .5rem 1rem; }
+    .audit-detail-list { display: grid; grid-template-columns: minmax(5rem, max-content) minmax(0, 1fr); gap: .55rem 1rem; width: 100%; margin: 0; padding: 1rem; border-radius: .85rem; background: var(--background); font-size: .82rem; }
+    .audit-detail-list dt { color: var(--muted); font-weight: 650; }
+    .audit-detail-list dd { min-width: 0; margin: 0; overflow-wrap: anywhere; word-break: break-word; }
     .audit-empty { padding: 3rem 1rem; color: var(--muted); text-align: center; }
     @media (max-width: 52rem) {
       .audit-filter-grid, .audit-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .audit-metric:nth-child(3) { border-left: 0; }
       .audit-metric:nth-child(n+3) { border-top: 1px solid var(--border); }
-      .audit-table th:nth-child(5), .audit-table td:nth-child(5) { display: none; }
+      .audit-table th:nth-child(5), .audit-event-row > td:nth-child(5) { display: none; }
     }
     @media (max-width: 30rem) {
       .shell { padding: 1.1rem 1rem; }
@@ -261,8 +264,9 @@ PAGE = """<!doctype html>
       .audit-heading-tools { width: 100%; justify-content: flex-start; }
       .audit-filter-grid, .audit-summary { grid-template-columns: 1fr; }
       .audit-metric + .audit-metric { border-left: 0; border-top: 1px solid var(--border); }
-      .audit-table th:nth-child(1), .audit-table td:nth-child(1) { width: 7rem; }
-      .audit-table th:nth-child(4), .audit-table td:nth-child(4) { display: none; }
+      .audit-table th:nth-child(1), .audit-event-row > td:nth-child(1) { width: 7rem; }
+      .audit-table th:nth-child(4), .audit-event-row > td:nth-child(4) { display: none; }
+      .audit-detail-list { grid-template-columns: 4.5rem minmax(0, 1fr); gap: .5rem .75rem; padding: .85rem; }
     }
     @media (prefers-color-scheme: dark) {
       :root { color-scheme: dark; --background: #111113; --surface: #1c1c1e; --text: #f5f5f7; --muted: #b0b0b7; --border: #45454a; --accent: #64b5ff; --focus: #64b5ff; --message: #172b40; --error: #39201f; --toolbar: rgba(17, 17, 19, .9); }
@@ -430,18 +434,19 @@ PAGE = """<!doctype html>
               <thead><tr><th scope="col">시각</th><th scope="col">결과</th><th scope="col">행동</th><th scope="col">사용자</th><th scope="col">IP</th><th scope="col">상세</th></tr></thead>
               <tbody id="audit-events" data-poll-url="{{ poll_url or '' }}" data-latest-id="{{ latest_id }}">
                 {% for event in events %}
-                  <tr data-event-id="{{ event.id }}">
+                  <tr class="audit-event-row" data-event-id="{{ event.id }}" data-detail-id="audit-detail-{{ event.id }}">
                     <td><time class="audit-time" datetime="{{ event.created_at }}">{{ event.display_time }}</time></td>
                     <td><span class="audit-badge {{ event.outcome }}">{{ event.outcome_label }}</span></td>
                     <td>{{ event.event_label }}<span class="audit-secondary">{{ event.channel }} · {{ event.target }}</span></td>
                     <td>{{ event.actor }}</td>
                     <td class="audit-ip" dir="ltr" translate="no">{{ event.source_ip }}</td>
-                    <td><details class="audit-detail"><summary>보기</summary><dl>
-                      <dt>대상</dt><dd>{{ event.target }}</dd><dt>경로</dt><dd>{{ event.channel }}</dd><dt>사유</dt><dd>{{ event.reason }}</dd>
-                      <dt>IP</dt><dd dir="ltr" translate="no">{{ event.source_ip }}</dd><dt>User-Agent</dt><dd>{{ event.user_agent }}</dd>
-                      <dt>요청 ID</dt><dd dir="ltr" translate="no">{{ event.request_id }}</dd>
-                    </dl></details></td>
+                    <td><button class="audit-detail-toggle" type="button" aria-expanded="false" aria-controls="audit-detail-{{ event.id }}">보기</button></td>
                   </tr>
+                  <tr id="audit-detail-{{ event.id }}" class="audit-detail-row" hidden><td colspan="6"><dl class="audit-detail-list">
+                    <dt>대상</dt><dd>{{ event.target }}</dd><dt>경로</dt><dd>{{ event.channel }}</dd><dt>사유</dt><dd>{{ event.reason }}</dd>
+                    <dt>IP</dt><dd dir="ltr" translate="no">{{ event.source_ip }}</dd><dt>User-Agent</dt><dd>{{ event.user_agent }}</dd>
+                    <dt>요청 ID</dt><dd dir="ltr" translate="no">{{ event.request_id }}</dd>
+                  </dl></td></tr>
                 {% endfor %}
                 {% if not events %}<tr id="audit-empty"><td class="audit-empty" colspan="6">조건에 맞는 활동 기록이 없습니다.</td></tr>{% endif %}
               </tbody>

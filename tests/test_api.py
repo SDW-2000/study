@@ -348,6 +348,8 @@ class AuditLogTests(IsolatedApp):
         self.assertEqual(page.status_code, 200)
         self.assertIn("활동 기록", page.text)
         self.assertIn("/static/admin_audit.js", page.text)
+        self.assertIn('class="audit-detail-row"', page.text)
+        self.assertIn('colspan="6"', page.text)
         self.assertIn("script-src 'self'", page.headers["Content-Security-Policy"])
         polling = admin.get("/api/admin/audit/events?after_id=0")
         self.assertEqual(polling.status_code, 200)

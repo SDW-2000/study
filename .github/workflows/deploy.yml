@@ -15,6 +15,7 @@ jobs:
           username: ${{ secrets.GCP_USER }}
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
-            cd test_proj
+            set -e
+            cd study
             git pull
             docker compose up -d --build

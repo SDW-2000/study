@@ -1,12 +1,41 @@
+# Python environments and generated files
 .venv/
+venv/
 __pycache__/
-*.pyc
-users.db
-users.db-*
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Secrets (keep the safe configuration example)
 .env
 .env.*
 !.env.example
 .admin-initial-password
+*.key
+*.pem
+*.p12
+*.pfx
+
+# SQLite databases, journals, and persistent deployment data
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
 data/
 backups/
+certs/
+caddy_data/
+caddy_config/
 memo-root.crt
+
+# Local logs and macOS metadata
+*.log
+.DS_Store
+._*

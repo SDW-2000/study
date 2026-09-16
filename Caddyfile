@@ -1,6 +1,7 @@
 {
 	admin off
 	skip_install_trust
+	default_sni {$SITE_ADDRESS}
 }
 
 {$SITE_ADDRESS} {
